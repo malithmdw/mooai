@@ -7,12 +7,39 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
-from src.api.main import create_app
+from src.core.config import get_settings
+
+
+@pytest.fixture(autouse=True)
+def _default_settings_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Provide the minimum required configuration for every test.
+
+    `POSTGRES_URL` and `REDIS_URL` have no defaults (see
+    `src.core.config.Settings`), so every test needs them present unless it
+    is specifically exercising the "missing required configuration" case,
+    in which case it can `monkeypatch.delenv(...)` them within the same
+    test — `monkeypatch` fixtures are shared across a test's dependency
+    graph. The `get_settings()` cache is cleared before and after so no
+    test observes a value cached by an earlier one.
+    """
+    monkeypatch.setenv("POSTGRES_URL", "postgresql+asyncpg://test:test@localhost:5432/test")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture
 def client() -> Iterator[TestClient]:
-    """A `TestClient` bound to a freshly created app instance per test."""
+    """A `TestClient` bound to a freshly created app instance per test.
+
+    `create_app` is imported here rather than at module scope: importing
+    `src.api.main` triggers its module-level `app = create_app()`, which
+    reads settings — that must happen after `_default_settings_env` has
+    set the required environment variables, not at conftest import time.
+    """
+    from src.api.main import create_app
+
     app = create_app()
     with TestClient(app) as test_client:
         yield test_client
