@@ -1,3 +1,6 @@
+# --- Local-only project docs (kept on disk, not pushed to the remote) ---
+CLAUDE.md
+
 # --- Python ---
 __pycache__/
 *.py[cod]
