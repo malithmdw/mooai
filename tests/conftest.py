@@ -2,12 +2,31 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
 from src.core.config import get_settings
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Ensure required settings exist before any test module is imported.
+
+    Several modules (e.g. `src.api.main`, `src.observability.tracing`)
+    call `get_logger(__name__)` at import time, which calls
+    `configure_logging()` -> `get_settings()` — so `Settings`' required
+    fields (`POSTGRES_URL`, `REDIS_URL`) must already be present in the
+    environment before pytest imports the *first* test module, earlier
+    than even an autouse fixture can run. `pytest_configure` is the one
+    hook guaranteed to run before collection. Individual tests still
+    override these via `monkeypatch` as needed (see
+    `_default_settings_env` below).
+    """
+    del config  # required by the pytest_configure hook signature, unused here
+    os.environ.setdefault("POSTGRES_URL", "postgresql+asyncpg://test:test@localhost:5432/test")
+    os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 
 
 @pytest.fixture(autouse=True)

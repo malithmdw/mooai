@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from src.api.routes import health
 from src.core.config import get_settings
 from src.core.logging import configure_logging, get_logger
+from src.observability import configure_tracing
 
 logger = get_logger(__name__)
 
@@ -27,6 +28,7 @@ def create_app() -> FastAPI:
     in tests.
     """
     configure_logging()
+    configure_tracing()
     settings = get_settings()
 
     app = FastAPI(
