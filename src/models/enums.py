@@ -13,6 +13,7 @@ class Role(StrEnum):
     """
 
     VIEWER = "VIEWER"
+    ENGINEER = "ENGINEER"
     ANALYST = "ANALYST"
     ADMINISTRATOR = "ADMINISTRATOR"
 

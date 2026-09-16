@@ -1,4 +1,4 @@
-.PHONY: help install dev-install run api streamlit test lint typecheck check fmt clean
+.PHONY: help install dev-install run api streamlit ingest test lint typecheck check fmt clean
 
 help:
 	@echo "Available targets:"
@@ -6,6 +6,7 @@ help:
 	@echo "  dev-install  Install runtime + dev dependencies"
 	@echo "  api          Run the FastAPI app (uvicorn, reload)"
 	@echo "  streamlit    Run the Streamlit UI"
+	@echo "  ingest       Run the document ingestion pipeline (data/knowledge → stdout JSONL)"
 	@echo "  test         Run pytest"
 	@echo "  lint         Run ruff check"
 	@echo "  fmt          Run ruff format"
@@ -24,6 +25,9 @@ api:
 
 streamlit:
 	streamlit run scripts/streamlit_app.py
+
+ingest:
+	python -m scripts.ingest
 
 test:
 	pytest
