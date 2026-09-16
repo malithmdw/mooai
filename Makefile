@@ -1,4 +1,4 @@
-.PHONY: help install dev-install run api streamlit ingest test lint typecheck check fmt clean
+.PHONY: help install dev-install run api streamlit ingest index index-init test lint typecheck check fmt clean
 
 help:
 	@echo "Available targets:"
@@ -7,6 +7,8 @@ help:
 	@echo "  api          Run the FastAPI app (uvicorn, reload)"
 	@echo "  streamlit    Run the Streamlit UI"
 	@echo "  ingest       Run the document ingestion pipeline (data/knowledge → stdout JSONL)"
+	@echo "  index        Ingest, embed, and upsert documents to Pinecone"
+	@echo "  index-init   Create the Pinecone index (run once before first index build)"
 	@echo "  test         Run pytest"
 	@echo "  lint         Run ruff check"
 	@echo "  fmt          Run ruff format"
@@ -28,6 +30,12 @@ streamlit:
 
 ingest:
 	python -m scripts.ingest
+
+index:
+	python -m scripts.index
+
+index-init:
+	python -m scripts.index --init
 
 test:
 	pytest
