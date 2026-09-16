@@ -561,8 +561,8 @@ class TestHallucinatedCitation:
         update = await node(state)
         assert update.get("response")
 
-    async def test_valid_citation_kept_alongside_hallucinated(self) -> None:
-        """Valid citations survive even when the batch contains a hallucination."""
+    async def test_mixed_citations_trigger_retry_and_safe_failure(self) -> None:
+        """Any invalid citation triggers retry; safe failure if retry also fails."""
         ev1 = _evidence("DOC-001-chunk-0000", "DOC-001")
         state = _state(retrieved=[ev1])
         mixed_input = {
@@ -585,11 +585,16 @@ class TestHallucinatedCitation:
             "limitations": "Partial information.",
             "reasoning_summary": "One valid source found.",
         }
+        # Mock always returns the same mixed response — retry also fails → safe failure.
         node = make_response_node(client=_mock_client(mixed_input), model="test")
         update = await node(state)
+        # Hallucinated chunk must never appear in citations
         citation_ids = [c.evidence_id for c in update.get("citations", [])]
-        assert "DOC-001-chunk-0000" in citation_ids
         assert "INVENTED-chunk-0001" not in citation_ids
+        # Safe failure response is non-empty
+        assert update.get("response")
+        # At least one validation failure recorded
+        assert any(not vr.is_valid for vr in update.get("validation_results", []))
 
 
 class TestMissingEvidence:

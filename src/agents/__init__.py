@@ -30,9 +30,14 @@ Response
 - ``ResponseDecision``   — Pydantic model for structured LLM output.
 - ``ResponseAgent``      — Agent class (prefer ``make_response_node``).
 - ``make_response_node`` — Factory returning a LangGraph node callable.
+
+Guardrails
+- ``CitationGuardrail``     — Validates every citation against retrieved evidence.
+- ``SAFE_FAILURE_RESPONSE`` — Canned message when all validation attempts fail.
 """
 
 from src.agents.budget import ExecutionBudget
+from src.agents.guardrails import SAFE_FAILURE_RESPONSE, CitationGuardrail
 from src.agents.response import ConfidenceLevel, ResponseAgent, ResponseDecision, make_response_node
 from src.agents.retrieval import RetrievalAgent, generate_queries, make_retrieval_node
 from src.agents.state import GraphState, initial_state
@@ -53,4 +58,6 @@ __all__ = [
     "ResponseDecision",
     "ResponseAgent",
     "make_response_node",
+    "CitationGuardrail",
+    "SAFE_FAILURE_RESPONSE",
 ]

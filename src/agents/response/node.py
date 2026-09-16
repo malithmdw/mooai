@@ -31,11 +31,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Coroutine
 from typing import Any
-from uuid import uuid4
 
 import anthropic
 from pydantic import ValidationError
 
+from src.agents.guardrails.citation_validation import SAFE_FAILURE_RESPONSE, CitationGuardrail
 from src.agents.response.models import CitedChunk, ConfidenceLevel, ResponseDecision
 from src.agents.response.prompts import (
     build_messages,
@@ -52,6 +52,7 @@ from src.models.validation import ValidationResult
 from src.retrieval.hybrid.models import RetrievalEvidence
 
 _logger = get_logger(__name__)
+_guardrail = CitationGuardrail()
 
 # Maximum evidence items forwarded to the LLM.  Higher-ranked items are
 # preferred; excess items are silently discarded to keep the prompt bounded.
@@ -391,20 +392,134 @@ class ResponseAgent:
             conversation_id=conv_id,
         )
 
-        # --- Citation cross-validation --------------------------------------
-        valid_citations, validation_result = _validate_citations(
-            decision.cited_chunks, retrieved
+        # --- Citation guardrail (attempt 1) ---------------------------------
+        valid_citations, validation_result = _guardrail.validate(
+            decision=decision,
+            retrieved=retrieved,
+            user=state["user"],
+            conversation_id=conv_id,
         )
 
         if not validation_result.is_valid:
             log_warning(
                 _logger,
-                "response.hallucinated_citations",
-                "Hallucinated or invalid citations stripped from response",
-                stripped_count=len(decision.cited_chunks) - len(valid_citations),
-                errors=list(validation_result.errors),
+                "response.guardrail_retry",
+                "Citation guardrail failed on first attempt; regenerating",
+                error_count=len(validation_result.errors),
                 conversation_id=conv_id,
             )
+
+            # --- Regeneration call ------------------------------------------
+            try:
+                regen_api_response = await self._client.messages.create(
+                    model=self._model,
+                    max_tokens=1024,
+                    system=system_prompt,
+                    tools=[_RESPONSE_TOOL],  # type: ignore[list-item]
+                    tool_choice={"type": "tool", "name": "response_output"},
+                    messages=messages,  # type: ignore[arg-type]
+                )
+            except Exception as exc:
+                log_error(
+                    _logger,
+                    "response.regeneration_error",
+                    "Anthropic call failed during regeneration",
+                    error=exc,
+                    conversation_id=conv_id,
+                )
+                return {
+                    "response": SAFE_FAILURE_RESPONSE,
+                    "current_agent": AgentState.RESPONSE,
+                    "current_node": "response",
+                    "errors": [f"response regeneration failed: {exc}"],
+                    "validation_results": [validation_result],
+                    "budget": new_budget,
+                }
+
+            regen_tokens = (
+                regen_api_response.usage.input_tokens
+                + regen_api_response.usage.output_tokens
+            )
+            new_budget = new_budget.consume(tokens=regen_tokens)
+
+            regen_tool_block = next(
+                (
+                    b
+                    for b in regen_api_response.content
+                    if getattr(b, "type", None) == "tool_use"
+                ),
+                None,
+            )
+            if regen_tool_block is None:
+                log_error(
+                    _logger,
+                    "response.regeneration_no_tool_block",
+                    "Regeneration returned no tool-use block",
+                    conversation_id=conv_id,
+                )
+                return {
+                    "response": SAFE_FAILURE_RESPONSE,
+                    "current_agent": AgentState.RESPONSE,
+                    "current_node": "response",
+                    "errors": ["response regeneration returned no tool-use block"],
+                    "validation_results": [validation_result],
+                    "budget": new_budget,
+                }
+
+            try:
+                regen_decision = ResponseDecision.model_validate(regen_tool_block.input)
+            except ValidationError as exc:
+                log_error(
+                    _logger,
+                    "response.regeneration_parse_error",
+                    "Regenerated ResponseDecision failed Pydantic validation",
+                    error=exc,
+                    conversation_id=conv_id,
+                )
+                return {
+                    "response": SAFE_FAILURE_RESPONSE,
+                    "current_agent": AgentState.RESPONSE,
+                    "current_node": "response",
+                    "errors": [f"response regeneration parse failed: {exc}"],
+                    "validation_results": [validation_result],
+                    "budget": new_budget,
+                }
+
+            log_debug(
+                _logger,
+                "response.regeneration_reasoning_summary",
+                "Regeneration reasoning summary (internal)",
+                reasoning_summary=regen_decision.reasoning_summary,
+                confidence=regen_decision.confidence,
+                conversation_id=conv_id,
+            )
+
+            # --- Citation guardrail (attempt 2) -----------------------------
+            valid_citations, regen_validation_result = _guardrail.validate(
+                decision=regen_decision,
+                retrieved=retrieved,
+                user=state["user"],
+                conversation_id=conv_id,
+            )
+
+            if not regen_validation_result.is_valid:
+                log_warning(
+                    _logger,
+                    "response.guardrail_safe_failure",
+                    "Citation guardrail failed after regeneration; returning safe failure",
+                    conversation_id=conv_id,
+                )
+                return {
+                    "response": SAFE_FAILURE_RESPONSE,
+                    "current_agent": AgentState.RESPONSE,
+                    "current_node": "response",
+                    "errors": ["citation guardrail failed after regeneration"],
+                    "validation_results": [validation_result, regen_validation_result],
+                    "budget": new_budget,
+                }
+
+            decision = regen_decision
+            validation_result = regen_validation_result
 
         # --- Convert to Evidence / Citation objects -------------------------
         retrieved_index: dict[str, RetrievalEvidence] = {
