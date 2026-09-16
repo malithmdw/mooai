@@ -1,4 +1,4 @@
-"""Tests for chunk_to_metadata and build_access_filter."""
+"""Tests for chunk_to_metadata, metadata_to_chunk, and build_access_filter."""
 
 from __future__ import annotations
 
@@ -8,7 +8,11 @@ import pytest
 
 from src.models.documents import DocumentMetadata
 from src.models.enums import AccessLevel, Role
-from src.retrieval.indexing.metadata import build_access_filter, chunk_to_metadata
+from src.retrieval.indexing.metadata import (
+    build_access_filter,
+    chunk_to_metadata,
+    metadata_to_chunk,
+)
 from src.retrieval.ingestion.models import DocumentChunk
 
 
@@ -222,3 +226,87 @@ class TestBuildAccessFilter:
         result = build_access_filter(all_roles)
         role_strings = set(result["allowed_roles"]["$in"])  # type: ignore[index]
         assert role_strings == {r.value for r in Role}
+
+
+# ---------------------------------------------------------------------------
+# metadata_to_chunk — inverse of chunk_to_metadata
+# ---------------------------------------------------------------------------
+
+
+class TestMetadataToChunk:
+    def test_round_trip(self) -> None:
+        original = _make_chunk()
+        meta = chunk_to_metadata(original)
+        # metadata_to_chunk accepts dict[str, object]
+        reconstructed = metadata_to_chunk(dict(meta))  # type: ignore[arg-type]
+        assert reconstructed.chunk_id == original.chunk_id
+        assert reconstructed.document_id == original.document_id
+        assert reconstructed.title == original.title
+        assert reconstructed.section == original.section
+        assert reconstructed.chunk_index == original.chunk_index
+        assert reconstructed.chunk_total == original.chunk_total
+        assert reconstructed.text == original.text
+
+    def test_metadata_fields_round_trip(self) -> None:
+        original = _make_chunk(
+            department="Payments Engineering",
+            document_type="incident_report",
+            access_level=AccessLevel.CONFIDENTIAL,
+            created_date=date(2024, 6, 30),
+            allowed_roles=(Role.ANALYST, Role.ADMINISTRATOR),
+        )
+        meta = chunk_to_metadata(original)
+        reconstructed = metadata_to_chunk(dict(meta))  # type: ignore[arg-type]
+        assert reconstructed.metadata.department == "Payments Engineering"
+        assert reconstructed.metadata.document_type == "incident_report"
+        assert reconstructed.metadata.access_level == AccessLevel.CONFIDENTIAL
+        assert reconstructed.metadata.created_date == date(2024, 6, 30)
+        assert set(reconstructed.metadata.allowed_roles) == {Role.ANALYST, Role.ADMINISTRATOR}
+
+    def test_chunk_index_preserved(self) -> None:
+        original = _make_chunk(chunk_index=7, chunk_total=10)
+        meta = chunk_to_metadata(original)
+        reconstructed = metadata_to_chunk(dict(meta))  # type: ignore[arg-type]
+        assert reconstructed.chunk_index == 7
+        assert reconstructed.chunk_total == 10
+
+    def test_chunk_index_is_int_in_result(self) -> None:
+        meta = chunk_to_metadata(_make_chunk(chunk_index=3))
+        reconstructed = metadata_to_chunk(dict(meta))  # type: ignore[arg-type]
+        assert isinstance(reconstructed.chunk_index, int)
+
+    def test_chunk_index_from_float_value(self) -> None:
+        # Pinecone may return numeric metadata as float
+        meta: dict[str, object] = dict(chunk_to_metadata(_make_chunk(chunk_index=2)))  # type: ignore[arg-type]
+        meta["chunk_index"] = 2.0
+        meta["chunk_total"] = 5.0
+        reconstructed = metadata_to_chunk(meta)
+        assert reconstructed.chunk_index == 2
+        assert reconstructed.chunk_total == 5
+
+    def test_raises_on_non_numeric_chunk_index(self) -> None:
+        meta: dict[str, object] = dict(chunk_to_metadata(_make_chunk()))  # type: ignore[arg-type]
+        meta["chunk_index"] = "not-a-number"
+        with pytest.raises(ValueError, match="chunk_index"):
+            metadata_to_chunk(meta)
+
+    def test_raises_on_non_list_allowed_roles(self) -> None:
+        meta: dict[str, object] = dict(chunk_to_metadata(_make_chunk()))  # type: ignore[arg-type]
+        meta["allowed_roles"] = "ENGINEER"
+        with pytest.raises(ValueError, match="allowed_roles"):
+            metadata_to_chunk(meta)
+
+    def test_allowed_roles_order_preserved(self) -> None:
+        original = _make_chunk(allowed_roles=(Role.ENGINEER, Role.ANALYST, Role.ADMINISTRATOR))
+        meta = chunk_to_metadata(original)
+        reconstructed = metadata_to_chunk(dict(meta))  # type: ignore[arg-type]
+        assert list(reconstructed.metadata.allowed_roles) == [
+            Role.ENGINEER, Role.ANALYST, Role.ADMINISTRATOR
+        ]
+
+    def test_all_access_levels_round_trip(self) -> None:
+        for level in AccessLevel:
+            original = _make_chunk(access_level=level)
+            meta = chunk_to_metadata(original)
+            reconstructed = metadata_to_chunk(dict(meta))  # type: ignore[arg-type]
+            assert reconstructed.metadata.access_level == level

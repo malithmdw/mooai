@@ -13,7 +13,9 @@ audit.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import date
 
+from src.models.documents import DocumentMetadata
 from src.models.enums import AccessLevel, Role
 from src.retrieval.ingestion.models import DocumentChunk
 
@@ -50,6 +52,49 @@ def chunk_to_metadata(chunk: DocumentChunk) -> PineconeMetadata:
         "created_date": chunk.metadata.created_date.isoformat(),
         "allowed_roles": [r.value for r in chunk.metadata.allowed_roles],
     }
+
+
+def metadata_to_chunk(meta: dict[str, object]) -> DocumentChunk:
+    """Reconstruct a ``DocumentChunk`` from a Pinecone metadata dict.
+
+    This is the inverse of ``chunk_to_metadata``.  All type narrowing
+    is explicit so the function fails loudly if the stored metadata is
+    malformed rather than silently producing an invalid chunk.
+
+    Designed to convert the ``metadata`` field on Pinecone query matches
+    back to a strongly-typed ``DocumentChunk`` for use in the retrieval
+    layer without a secondary database lookup.
+    """
+    raw_index = meta.get("chunk_index")
+    raw_total = meta.get("chunk_total")
+    raw_roles = meta.get("allowed_roles")
+
+    if not isinstance(raw_index, (int, float)):
+        raise ValueError(f"chunk_index must be numeric, got {type(raw_index)}")
+    if not isinstance(raw_total, (int, float)):
+        raise ValueError(f"chunk_total must be numeric, got {type(raw_total)}")
+    if not isinstance(raw_roles, list):
+        raise ValueError(f"allowed_roles must be a list, got {type(raw_roles)}")
+
+    doc_meta = DocumentMetadata(
+        document_id=str(meta["document_id"]),
+        title=str(meta["title"]),
+        department=str(meta["department"]),
+        document_type=str(meta["document_type"]),
+        access_level=AccessLevel(str(meta["access_level"])),
+        created_date=date.fromisoformat(str(meta["created_date"])),
+        allowed_roles=tuple(Role(str(r)) for r in raw_roles),
+    )
+    return DocumentChunk(
+        chunk_id=str(meta["chunk_id"]),
+        document_id=str(meta["document_id"]),
+        title=str(meta["title"]),
+        section=str(meta["section"]),
+        chunk_index=int(raw_index),
+        chunk_total=int(raw_total),
+        text=str(meta["text"]),
+        metadata=doc_meta,
+    )
 
 
 def build_access_filter(

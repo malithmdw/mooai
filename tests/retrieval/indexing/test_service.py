@@ -17,6 +17,7 @@ from src.models.enums import AccessLevel, Role
 from src.retrieval.indexing.service import (
     DEFAULT_BATCH_SIZE,
     PineconeIndexService,
+    PineconeMatch,
     UpsertResult,
     make_pinecone_service,
 )
@@ -362,6 +363,126 @@ class TestDescribeStats:
 # ---------------------------------------------------------------------------
 # make_pinecone_service factory
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# search
+# ---------------------------------------------------------------------------
+
+
+def _scored_vector(
+    vid: str,
+    score: float,
+    metadata: dict[str, object] | None = None,
+) -> MagicMock:
+    m = MagicMock()
+    m.id = vid
+    m.score = score
+    m.metadata = metadata or {}
+    return m
+
+
+def _query_response(matches: list[MagicMock]) -> MagicMock:
+    r = MagicMock()
+    r.matches = matches
+    return r
+
+
+class TestSearch:
+    async def test_returns_list_of_pinecone_matches(self) -> None:
+        service, mock_index = _make_service()
+        mock_index.query.return_value = _query_response([
+            _scored_vector("A-chunk-0000", 0.95),
+        ])
+        results = await service.search([0.1, 0.2, 0.3])
+        assert isinstance(results, list)
+        assert all(isinstance(r, PineconeMatch) for r in results)
+
+    async def test_empty_matches_returns_empty_list(self) -> None:
+        service, mock_index = _make_service()
+        mock_index.query.return_value = _query_response([])
+        results = await service.search([0.1])
+        assert results == []
+
+    async def test_none_matches_attribute_returns_empty(self) -> None:
+        service, mock_index = _make_service()
+        r = MagicMock()
+        r.matches = None
+        mock_index.query.return_value = r
+        results = await service.search([0.1])
+        assert results == []
+
+    async def test_chunk_id_extracted(self) -> None:
+        service, mock_index = _make_service()
+        mock_index.query.return_value = _query_response([
+            _scored_vector("ARCH-001-chunk-0002", 0.88),
+        ])
+        results = await service.search([0.1])
+        assert results[0].chunk_id == "ARCH-001-chunk-0002"
+
+    async def test_score_extracted(self) -> None:
+        service, mock_index = _make_service()
+        mock_index.query.return_value = _query_response([
+            _scored_vector("A-chunk-0000", 0.72),
+        ])
+        results = await service.search([0.1])
+        assert abs(results[0].score - 0.72) < 1e-9
+
+    async def test_metadata_extracted(self) -> None:
+        service, mock_index = _make_service()
+        meta: dict[str, object] = {"document_id": "ARCH-001", "text": "hello"}
+        mock_index.query.return_value = _query_response([
+            _scored_vector("A-chunk-0000", 0.9, metadata=meta),
+        ])
+        results = await service.search([0.1])
+        assert results[0].metadata["document_id"] == "ARCH-001"
+
+    async def test_top_k_passed_to_query(self) -> None:
+        service, mock_index = _make_service()
+        mock_index.query.return_value = _query_response([])
+        await service.search([0.1], top_k=25)
+        _, kwargs = mock_index.query.call_args
+        assert kwargs["top_k"] == 25
+
+    async def test_filter_passed_to_query(self) -> None:
+        service, mock_index = _make_service()
+        mock_index.query.return_value = _query_response([])
+        filt = {"allowed_roles": {"$in": ["ENGINEER"]}}
+        await service.search([0.1], filter=filt)
+        _, kwargs = mock_index.query.call_args
+        assert kwargs["filter"] == filt
+
+    async def test_no_filter_passes_none(self) -> None:
+        service, mock_index = _make_service()
+        mock_index.query.return_value = _query_response([])
+        await service.search([0.1])
+        _, kwargs = mock_index.query.call_args
+        assert kwargs["filter"] is None
+
+    async def test_namespace_passed_to_query(self) -> None:
+        service, mock_index = _make_service(namespace="staging")
+        mock_index.query.return_value = _query_response([])
+        await service.search([0.1])
+        _, kwargs = mock_index.query.call_args
+        assert kwargs["namespace"] == "staging"
+
+    async def test_include_metadata_always_true(self) -> None:
+        service, mock_index = _make_service()
+        mock_index.query.return_value = _query_response([])
+        await service.search([0.1])
+        _, kwargs = mock_index.query.call_args
+        assert kwargs["include_metadata"] is True
+
+    async def test_multiple_matches_returned_in_order(self) -> None:
+        service, mock_index = _make_service()
+        mock_index.query.return_value = _query_response([
+            _scored_vector("A-chunk-0000", 0.95),
+            _scored_vector("B-chunk-0000", 0.80),
+            _scored_vector("C-chunk-0000", 0.65),
+        ])
+        results = await service.search([0.1])
+        ids = [r.chunk_id for r in results]
+        assert ids == ["A-chunk-0000", "B-chunk-0000", "C-chunk-0000"]
 
 
 class TestMakePineconeService:

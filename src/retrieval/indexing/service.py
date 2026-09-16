@@ -67,6 +67,16 @@ class UpsertResult(BaseModel):
     batch_count: int = Field(ge=0, description="Number of Pinecone upsert API calls made.")
 
 
+class PineconeMatch(BaseModel):
+    """One result from a Pinecone vector similarity query."""
+
+    model_config = ConfigDict(frozen=True)
+
+    chunk_id: str = Field(min_length=1, description="Pinecone vector ID (equals chunk_id).")
+    score: float = Field(ge=0.0, description="Cosine similarity score.")
+    metadata: dict[str, object] = Field(description="All stored metadata fields.")
+
+
 class PineconeIndexService:
     """Async-compatible service for Pinecone vector index operations.
 
@@ -230,6 +240,51 @@ class PineconeIndexService:
             ids=list(chunk_ids),
             namespace=self._namespace,
         )
+
+    async def search(
+        self,
+        vector: list[float],
+        *,
+        top_k: int = 10,
+        filter: dict[str, object] | None = None,
+    ) -> list[PineconeMatch]:
+        """Query the Pinecone index for vectors nearest to *vector*.
+
+        Returns up to *top_k* results ordered by cosine similarity descending.
+        Pass *filter* to restrict results via Pinecone's metadata filter
+        syntax (build the filter with ``build_access_filter`` for RBAC).
+
+        The ``include_metadata=True`` flag is always set so callers can
+        reconstruct ``DocumentChunk`` objects without a secondary lookup via
+        ``metadata_to_chunk``.
+        """
+        log_debug(
+            _logger,
+            "indexing.search",
+            "Querying Pinecone index",
+            top_k=top_k,
+            namespace=self._namespace,
+            has_filter=filter is not None,
+        )
+
+        def _query() -> list[PineconeMatch]:
+            response = self._index.query(
+                vector=vector,
+                top_k=top_k,
+                namespace=self._namespace,
+                filter=filter,
+                include_metadata=True,
+            )
+            return [
+                PineconeMatch(
+                    chunk_id=str(match.id),
+                    score=float(match.score),
+                    metadata=dict(match.metadata or {}),
+                )
+                for match in (response.matches or [])
+            ]
+
+        return await asyncio.to_thread(_query)
 
     async def describe_stats(self) -> dict[str, object]:
         """Return index statistics as a plain dict.
