@@ -36,6 +36,8 @@ import anthropic
 from pydantic import ValidationError
 
 from src.agents.guardrails.citation_validation import SAFE_FAILURE_RESPONSE, CitationGuardrail
+from src.agents.guardrails.input_guard import DocumentInjectionGuard
+from src.agents.guardrails.output_guard import OutputGuard
 from src.agents.response.models import CitedChunk, ConfidenceLevel, ResponseDecision
 from src.agents.response.prompts import (
     build_messages,
@@ -53,6 +55,8 @@ from src.retrieval.hybrid.models import RetrievalEvidence
 
 _logger = get_logger(__name__)
 _guardrail = CitationGuardrail()
+_doc_guard = DocumentInjectionGuard()
+_output_guard = OutputGuard()
 
 # Maximum evidence items forwarded to the LLM.  Higher-ranked items are
 # preferred; excess items are silently discarded to keep the prompt bounded.
@@ -302,6 +306,18 @@ class ResponseAgent:
         # --- Select top evidence for the prompt -----------------------------
         top_evidence = sorted(retrieved, key=lambda e: -e.final_score)[: self._max_evidence]
 
+        # --- Document injection guard: strip malicious document content -----
+        top_evidence, flagged_docs = _doc_guard.filter(top_evidence)
+        if flagged_docs:
+            log_warning(
+                _logger,
+                "response.document_injection_detected",
+                "Document injection guard flagged and removed documents from evidence",
+                flagged_count=len(flagged_docs),
+                flagged_details=[f.threat_detail for f in flagged_docs],
+                conversation_id=conv_id,
+            )
+
         system_prompt = build_system_prompt(top_evidence)
         messages = build_messages(list(state["messages"]))
 
@@ -391,6 +407,27 @@ class ResponseAgent:
             confidence=decision.confidence,
             conversation_id=conv_id,
         )
+
+        # --- Output guard: catch system-prompt leakage / jailbreak success --
+        output_result = _output_guard.validate(decision.answer)
+        if not output_result.is_safe:
+            log_warning(
+                _logger,
+                "response.output_blocked",
+                "Output guard flagged LLM answer before returning to user",
+                threat_type=output_result.threat_type,
+                threat_detail=output_result.threat_detail,
+                conversation_id=conv_id,
+            )
+            return {
+                "response": SAFE_FAILURE_RESPONSE,
+                "current_agent": AgentState.RESPONSE,
+                "current_node": "response",
+                "errors": [
+                    f"output blocked: {output_result.threat_type}:{output_result.threat_detail}"
+                ],
+                "budget": new_budget,
+            }
 
         # --- Citation guardrail (attempt 1) ---------------------------------
         valid_citations, validation_result = _guardrail.validate(
@@ -493,6 +530,28 @@ class ResponseAgent:
                 confidence=regen_decision.confidence,
                 conversation_id=conv_id,
             )
+
+            # --- Output guard on regenerated answer -------------------------
+            regen_output_result = _output_guard.validate(regen_decision.answer)
+            if not regen_output_result.is_safe:
+                log_warning(
+                    _logger,
+                    "response.output_blocked_on_regen",
+                    "Output guard flagged regenerated answer",
+                    threat_type=regen_output_result.threat_type,
+                    threat_detail=regen_output_result.threat_detail,
+                    conversation_id=conv_id,
+                )
+                return {
+                    "response": SAFE_FAILURE_RESPONSE,
+                    "current_agent": AgentState.RESPONSE,
+                    "current_node": "response",
+                    "errors": [
+                        f"output blocked on regen: {regen_output_result.threat_type}:{regen_output_result.threat_detail}"
+                    ],
+                    "validation_results": [validation_result],
+                    "budget": new_budget,
+                }
 
             # --- Citation guardrail (attempt 2) -----------------------------
             valid_citations, regen_validation_result = _guardrail.validate(

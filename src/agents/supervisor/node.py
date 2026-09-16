@@ -9,14 +9,16 @@ import anthropic
 from pydantic import ValidationError
 
 from src.agents.budget import ExecutionBudget
+from src.agents.guardrails.input_guard import INJECTION_BLOCKED_RESPONSE, InputGuard
 from src.agents.state import GraphState
 from src.agents.supervisor.models import IntentType, SupervisorDecision
 from src.agents.supervisor.prompts import build_messages, build_system_prompt
 from src.core.config import get_settings
 from src.core.logging import get_logger, log_debug, log_error, log_info, log_warning
-from src.models.enums import AgentState
+from src.models.enums import AgentState, MessageRole
 
 _logger = get_logger(__name__)
+_input_guard = InputGuard()
 
 # ---------------------------------------------------------------------------
 # Anthropic tool definition for structured supervisor output
@@ -123,6 +125,34 @@ class SupervisorAgent:
                 "errors": ["supervisor skipped: execution budget exhausted"],
                 "budget": budget,
             }
+
+        # --- Input guard: block prompt injection before any LLM call ----------
+        last_user_message = next(
+            (m.content for m in reversed(list(state["messages"])) if m.role == MessageRole.USER),
+            None,
+        )
+        if last_user_message is not None:
+            guard_result = _input_guard.validate(last_user_message)
+            if not guard_result.is_safe:
+                log_warning(
+                    _logger,
+                    "supervisor.input_blocked",
+                    "Input guard blocked message before supervisor LLM call",
+                    threat_type=guard_result.threat_type,
+                    threat_detail=guard_result.threat_detail,
+                    conversation_id=state["conversation_id"],
+                )
+                return {
+                    "intent": IntentType.UNSUPPORTED_REQUEST,
+                    "task_plan": ["Input blocked by injection guard"],
+                    "response": INJECTION_BLOCKED_RESPONSE,
+                    "current_agent": AgentState.SUPERVISOR,
+                    "current_node": "supervisor",
+                    "errors": [
+                        f"input blocked: {guard_result.threat_type}:{guard_result.threat_detail}"
+                    ],
+                    "budget": budget,
+                }
 
         system_prompt = build_system_prompt(state["user_role"])
         messages = build_messages(list(state["messages"]))

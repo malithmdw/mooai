@@ -32,12 +32,31 @@ Response
 - ``make_response_node`` — Factory returning a LangGraph node callable.
 
 Guardrails
-- ``CitationGuardrail``     — Validates every citation against retrieved evidence.
-- ``SAFE_FAILURE_RESPONSE`` — Canned message when all validation attempts fail.
+- ``InputGuard``              — Pattern-based validator for user message text.
+- ``DocumentInjectionGuard``  — Scans retrieved documents for injected instructions.
+- ``OutputGuard``             — Scans LLM answers for leakage / jailbreak success.
+- ``ThreatType``              — StrEnum classifying detected injection categories.
+- ``InputValidationResult``   — Result of ``InputGuard.validate()``.
+- ``DocumentScanResult``      — Per-document result of ``DocumentInjectionGuard.scan()``.
+- ``OutputValidationResult``  — Result of ``OutputGuard.validate()``.
+- ``INJECTION_BLOCKED_RESPONSE`` — Generic refusal when user input is blocked.
+- ``CitationGuardrail``       — Validates every citation against retrieved evidence.
+- ``SAFE_FAILURE_RESPONSE``   — Canned message when all validation attempts fail.
 """
 
 from src.agents.budget import ExecutionBudget
-from src.agents.guardrails import SAFE_FAILURE_RESPONSE, CitationGuardrail
+from src.agents.guardrails import (
+    INJECTION_BLOCKED_RESPONSE,
+    SAFE_FAILURE_RESPONSE,
+    CitationGuardrail,
+    DocumentInjectionGuard,
+    DocumentScanResult,
+    InputGuard,
+    InputValidationResult,
+    OutputGuard,
+    OutputValidationResult,
+    ThreatType,
+)
 from src.agents.response import ConfidenceLevel, ResponseAgent, ResponseDecision, make_response_node
 from src.agents.retrieval import RetrievalAgent, generate_queries, make_retrieval_node
 from src.agents.state import GraphState, initial_state
@@ -58,6 +77,14 @@ __all__ = [
     "ResponseDecision",
     "ResponseAgent",
     "make_response_node",
+    "InputGuard",
+    "DocumentInjectionGuard",
+    "OutputGuard",
+    "ThreatType",
+    "InputValidationResult",
+    "DocumentScanResult",
+    "OutputValidationResult",
+    "INJECTION_BLOCKED_RESPONSE",
     "CitationGuardrail",
     "SAFE_FAILURE_RESPONSE",
 ]
