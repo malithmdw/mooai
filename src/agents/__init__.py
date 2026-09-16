@@ -5,6 +5,21 @@
 No other `src` package may import from `agents`. Agents must never bypass
 `security` to reach a tool or data source directly — see CLAUDE.md.
 
-No agent graphs are implemented yet; this package currently defines the
-architectural seam only.
+Public surface
+--------------
+State
+- ``GraphState``        — typed TypedDict for the LangGraph StateGraph schema.
+- ``initial_state``     — factory that creates a clean starting state.
+
+Budget
+- ``ExecutionBudget``   — resource limits and usage counters for one execution.
 """
+
+from src.agents.budget import ExecutionBudget
+from src.agents.state import GraphState, initial_state
+
+__all__ = [
+    "GraphState",
+    "initial_state",
+    "ExecutionBudget",
+]
