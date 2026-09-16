@@ -26,13 +26,22 @@ Security notes
 
 from __future__ import annotations
 
-from src.agents.response.models import CitedChunk, ResponseDecision
+from typing import TYPE_CHECKING
+
 from src.core.logging import get_logger, log_debug, log_warning
 from src.models.enums import AccessLevel, Role
 from src.models.user import User
 from src.models.validation import ValidationResult
 from src.observability.tracing import trace_validation
 from src.retrieval.hybrid.models import RetrievalEvidence
+
+if TYPE_CHECKING:
+    # Deferred to break the import cycle guardrails -> response -> guardrails
+    # (src.agents.response imports this module for SAFE_FAILURE_RESPONSE /
+    # CitationGuardrail). Safe at runtime: every use below is a type
+    # annotation only, and `from __future__ import annotations` (above)
+    # already makes annotations lazy strings.
+    from src.agents.response.models import CitedChunk, ResponseDecision
 
 _logger = get_logger(__name__)
 
