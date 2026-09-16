@@ -52,6 +52,7 @@ Security
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
@@ -65,26 +66,36 @@ from src.agents.research.models import (
     Claim,
     Contradiction,
     FinalSynthesis,
+    IncidentAnalysisResult,
+    IncidentFinalAnswer,
+    IncidentRootCauseFinding,
     QuestionAnalysis,
+    RecurringRootCause,
     ResearchFinding,
 )
 from src.agents.research.prompts import (
     build_aggregation_prompt,
     build_batch_analysis_prompt,
     build_final_synthesis_prompt,
+    build_incident_batch_prompt,
+    build_incident_final_answer_prompt,
     build_question_analysis_prompt,
 )
 from src.agents.state import GraphState
 from src.core.config import get_settings
 from src.core.logging import get_logger, log_error, log_info, log_warning
 from src.models.agent_events import AgentEvent
-from src.models.enums import AgentState, MessageRole, ResearchStatus, Role
+from src.models.enums import AccessLevel, AgentState, MessageRole, ResearchStatus, Role
 from src.models.evidence import Evidence
 from src.models.research import ResearchResult, ResearchTask
+from src.retrieval.hybrid.filtering import apply_access_filter
 from src.retrieval.hybrid.models import RetrievalEvidence
 from src.retrieval.hybrid.retriever import HybridRetriever
+from src.security.authorization import AuthorizationPolicy, Permission
+from src.tools.analysis import AnalysisOperation, AnalysisRequest, run_analysis
 
 _logger = get_logger(__name__)
+_policy = AuthorizationPolicy()
 
 _M = TypeVar("_M", bound=BaseModel)
 
@@ -113,6 +124,22 @@ MAX_EVIDENCE_POOL: int = 24
 
 MAX_EVIDENCE_PER_RESULT: int = 5
 """Cap on how many `Evidence` items any single `ResearchResult` carries."""
+
+RECURRING_THRESHOLD: int = 2
+"""Minimum distinct incidents citing the same root cause to call it "recurring"."""
+
+# Role -> permitted access levels, mirroring `src.agents.retrieval.node`'s
+# mapping (and `src.agents.guardrails.citation_validation`'s). Kept as a
+# small local copy rather than importing another module's private mapping —
+# see `_filter_by_authorization`, the incident workflow's explicit,
+# separately-audited re-check of what the general pipeline's retriever call
+# already enforces once (defense in depth, CLAUDE.md).
+_ROLE_ACCESS_LEVELS: dict[Role, frozenset[AccessLevel]] = {
+    Role.VIEWER: frozenset({AccessLevel.PUBLIC, AccessLevel.INTERNAL}),
+    Role.ENGINEER: frozenset({AccessLevel.PUBLIC, AccessLevel.INTERNAL}),
+    Role.ANALYST: frozenset({AccessLevel.PUBLIC, AccessLevel.INTERNAL, AccessLevel.CONFIDENTIAL}),
+    Role.ADMINISTRATOR: frozenset(AccessLevel),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +239,62 @@ _FINAL_SYNTHESIS_TOOL: dict[str, Any] = {
             },
         },
         "required": ["summary", "key_findings", "limitations", "confidence"],
+    },
+}
+
+_ROOT_CAUSE_ASSERTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "incident_id": {
+            "type": "string",
+            "description": "The incident's document/subject ID.",
+        },
+        "cause": {"type": "string", "description": "The asserted root cause."},
+        "chunk_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Evidence chunk_ids this assertion is drawn from.",
+        },
+    },
+    "required": ["incident_id", "cause", "chunk_ids"],
+}
+
+_INCIDENT_BATCH_TOOL: dict[str, Any] = {
+    "name": "incident_root_causes",
+    "description": (
+        "Record whether this batch concerns a payment outage/failure and any root "
+        "causes found. Call this tool exactly once."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "relevant": {
+                "type": "boolean",
+                "description": "True if this batch concerns a payment outage/failure incident.",
+            },
+            "summary": {"type": "string"},
+            "root_causes": {
+                "type": "array",
+                "items": _ROOT_CAUSE_ASSERTION_SCHEMA,
+            },
+        },
+        "required": ["relevant", "summary", "root_causes"],
+    },
+}
+
+_INCIDENT_FINAL_ANSWER_TOOL: dict[str, Any] = {
+    "name": "incident_final_answer",
+    "description": (
+        "Record the final narrative summary and limitations. Call this tool exactly "
+        "once. Do NOT invent, round, or restate any count not given to you verbatim."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "limitations": {"type": "string"},
+        },
+        "required": ["summary", "limitations"],
     },
 }
 
@@ -436,6 +519,131 @@ def _build_search_plan(
 
 
 # ---------------------------------------------------------------------------
+# Incident root-cause analysis workflow — pure helpers
+# ---------------------------------------------------------------------------
+
+
+def _access_levels_for_roles(roles: Sequence[Role]) -> list[AccessLevel]:
+    """Union of access levels permitted by *roles* — see `_ROLE_ACCESS_LEVELS`."""
+    permitted: set[AccessLevel] = set()
+    for role in roles:
+        permitted.update(_ROLE_ACCESS_LEVELS.get(role, frozenset()))
+    return list(permitted)
+
+
+def _filter_by_authorization(
+    evidence: Sequence[RetrievalEvidence], *, roles: Sequence[Role]
+) -> tuple[list[RetrievalEvidence], list[RetrievalEvidence]]:
+    """Stage 2 — explicit, separately-audited authorization re-check.
+
+    `HybridRetriever.search` already RBAC-filters by role (twice — see its
+    own docstring); this applies the same authoritative filter again, this
+    time also constrained by access level, as its own visible pipeline
+    stage with its own `AgentEvent` — defense in depth, and it makes the
+    authorization boundary inspectable in this workflow's trace, not just
+    enforced silently inside the retriever.
+
+    Returns `(authorized, rejected)`.
+    """
+    access_levels = _access_levels_for_roles(roles)
+    authorized = apply_access_filter(list(evidence), roles=roles, access_levels=access_levels)
+    authorized_ids = {ev.chunk_id for ev in authorized}
+    rejected = [ev for ev in evidence if ev.chunk_id not in authorized_ids]
+    return authorized, rejected
+
+
+def _verify_claims(
+    claims: Sequence[Claim], authorized_index: dict[str, RetrievalEvidence]
+) -> tuple[list[Claim], int]:
+    """Stage 8 — drop any claim not grounded in the authorized evidence pool.
+
+    A claim is verified only if every `chunk_id` it cites is present in
+    *authorized_index* — i.e. it was both actually retrieved and passed
+    authorization. This is what stops a hallucinated or unauthorized
+    "root cause" from ever reaching the counting step, let alone the user.
+    Runs before counting (not literally last in the pipeline) so that
+    Stage 6's counts are only ever built from verified data — see
+    `ResearchAgent.analyze_incident_root_causes`.
+
+    Returns `(verified_claims, unverified_count)`.
+    """
+    verified: list[Claim] = []
+    unverified = 0
+    for claim in claims:
+        if claim.chunk_ids and all(cid in authorized_index for cid in claim.chunk_ids):
+            verified.append(claim)
+        else:
+            unverified += 1
+    return verified, unverified
+
+
+def _select_analytics_role(roles: Sequence[Role]) -> Role | None:
+    """First held role authorized for `Permission.ANALYTICS`, or `None`.
+
+    The Python Analysis Tool is invoked on the requesting user's behalf —
+    see CLAUDE.md "Agents must never bypass application authorization" —
+    so if no held role carries analytics permission, the caller must skip
+    the tool rather than call it anyway.
+    """
+    for role in roles:
+        if _policy.is_allowed(role, Permission.ANALYTICS):
+            return role
+    return None
+
+
+_NUMBER_PATTERN = re.compile(r"\d+(?:\.\d+)?%?")
+
+
+def _numbers_in(text: str) -> set[str]:
+    """Every standalone digit sequence appearing in *text*.
+
+    Used both to find numbers to validate and to harvest "contextually
+    legitimate" numbers (a year mentioned in the question, digits embedded
+    in an incident/document ID) so they are never mistaken for an invented
+    statistic — see `_unsupported_numbers`.
+    """
+    return set(_NUMBER_PATTERN.findall(text))
+
+
+def _unsupported_numbers(text: str, allowed: set[str]) -> list[str]:
+    """Stage 9 guard — standalone numbers in *text* not present in *allowed*.
+
+    See CLAUDE.md "LLM output must be validated before use" and this
+    workflow's "do not allow unsupported statistical claims" requirement:
+    every number the model states must be traceable to a number it was
+    actually given (see `ResearchAgent._generate_incident_final_answer`,
+    which builds *allowed* from verified counts plus every number that
+    legitimately appears in the question or a known incident/document ID —
+    e.g. "2025" or the "001" in "INC-2025-001" — so restating those is
+    never flagged as an invented statistic).
+    """
+    found = _numbers_in(text)
+    return sorted(found - allowed)
+
+
+def _build_fallback_summary(
+    recurring: Sequence[RecurringRootCause], supporting_document_ids: Sequence[str]
+) -> str:
+    """Deterministic, template-only summary used when the LLM's narrative
+    cannot be trusted (no tool-use block, or it stated an unverified
+    number) — mirrors `SAFE_FAILURE_RESPONSE` in
+    `src.agents.guardrails.citation_validation`: safe, verified content
+    only, never LLM prose.
+    """
+    if not recurring:
+        return (
+            f"Reviewed {len(supporting_document_ids)} supporting document(s); "
+            "no root cause recurred across more than one incident in the evidence examined."
+        )
+    lines = [f"Reviewed {len(supporting_document_ids)} supporting document(s)."]
+    lines.append("Recurring root causes:")
+    for cause in recurring:
+        incidents = ", ".join(cause.incident_ids)
+        lines.append(f"- {cause.root_cause}: {cause.count} incident(s) ({incidents})")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Research Agent
 # ---------------------------------------------------------------------------
 
@@ -567,7 +775,12 @@ class ResearchAgent:
     # ------------------------------------------------------------------
 
     async def _discover_documents(
-        self, queries: list[str], roles: list[Role], ctx: _RunContext
+        self,
+        queries: list[str],
+        roles: Sequence[Role],
+        ctx: _RunContext,
+        *,
+        document_type: str | None = None,
     ) -> list[RetrievalEvidence]:
         """Run every search-plan query and merge results into one pool.
 
@@ -575,13 +788,19 @@ class ResearchAgent:
         `max_evidence_pool` — this pool is the largest amount of evidence
         ever held in memory at once, and it is never sent to the LLM in a
         single call; only bounded batches of it are (see
-        `_partition_into_batches`).
+        `_partition_into_batches`). `document_type` narrows discovery to one
+        document type (e.g. `"incident_report"`) when the caller already
+        knows the corpus of interest — see
+        `ResearchAgent.analyze_incident_root_causes`.
         """
         best: dict[str, RetrievalEvidence] = {}
         for query_index, query in enumerate(queries):
             try:
                 results = await self._retriever.search(
-                    query, top_k=self._top_k_per_query, roles=roles
+                    query,
+                    top_k=self._top_k_per_query,
+                    roles=roles,
+                    document_type=document_type,
                 )
             except Exception as exc:
                 log_error(
@@ -1042,6 +1261,493 @@ class ResearchAgent:
         if final is None:
             update["errors"] = ["research final synthesis failed"]
         return update
+
+    # ==================================================================
+    # Incident root-cause analysis workflow
+    # ==================================================================
+    #
+    # Extends the RLM implementation for the demonstration query: "Summarize
+    # all payment outages related to payment failures during 2025 and
+    # identify recurring root causes." See docs/rlm.md for the full
+    # walkthrough. Numbered stages below match the workflow's own spec, not
+    # the general pipeline's nine stages above (they overlap but are not
+    # identical — this workflow adds an explicit authorization re-check,
+    # Python-Analysis-Tool-backed recurrence counting, and an evidence
+    # verification gate the general pipeline does not have).
+
+    # ------------------------------------------------------------------
+    # Stage 4/5: batch-level root-cause extraction
+    # ------------------------------------------------------------------
+
+    async def _extract_root_causes_batch(
+        self, question: str, batch: list[RetrievalEvidence], *, batch_index: int, ctx: _RunContext
+    ) -> IncidentRootCauseFinding | None:
+        _emit(
+            ctx,
+            "batch_analysis",
+            {"batch_index": batch_index, "chunk_count": len(batch)},
+        )
+        return await self._call_structured(
+            system_prompt=build_incident_batch_prompt(question, batch),
+            user_content=f"Extract payment-outage root causes for: {question}",
+            tool=_INCIDENT_BATCH_TOOL,
+            tool_name="incident_root_causes",
+            model_cls=IncidentRootCauseFinding,
+            ctx=ctx,
+        )
+
+    # ------------------------------------------------------------------
+    # Stages 3-7 (recursive): partition, analyze batches, aggregate
+    # ------------------------------------------------------------------
+
+    async def _process_incident_task(
+        self,
+        task: ResearchTask,
+        question: str,
+        evidence_index: dict[str, RetrievalEvidence],
+        ctx: _RunContext,
+    ) -> ResearchTask:
+        """Recursive counterpart to `_process_task`, specialized for
+        root-cause extraction: same partition/recurse/aggregate structure
+        and the same depth/task budget guards (so this workflow is bounded
+        exactly like the general pipeline — see the module docstring), but
+        leaf analysis calls `_extract_root_causes_batch` instead of the
+        generic `_analyze_batch`, and every extracted root cause is
+        converted to a `Claim(attribute="root_cause", ...)` and pushed onto
+        `ctx.claims` for Stage 6 (recurring-pattern counting) and Stage 8
+        (evidence verification) to consume afterward.
+        """
+        task.status = ResearchStatus.IN_PROGRESS
+        ctx.budget = ctx.budget.consume(research_steps=1)
+
+        _emit(
+            ctx,
+            "recursion_step",
+            {
+                "task_id": task.task_id,
+                "parent_task_id": task.parent_task_id,
+                "depth": task.depth,
+                "max_depth": ctx.max_depth,
+                "document_count": len(task.document_ids),
+            },
+        )
+
+        chunks = sorted(
+            (evidence_index[cid] for cid in task.document_ids if cid in evidence_index),
+            key=lambda e: -e.final_score,
+        )
+        if not chunks:
+            task.status = ResearchStatus.COMPLETED
+            task.result = ResearchResult(
+                task_id=task.task_id, summary="No evidence was available for this batch."
+            )
+            return task
+
+        batches = _partition_into_batches(
+            chunks, max_chunks=self._max_chunks_per_batch, max_chars=self._max_chars_per_batch
+        )
+        _emit(
+            ctx,
+            "batch_processing",
+            {"task_id": task.task_id, "batch_count": len(batches), "chunk_count": len(chunks)},
+        )
+
+        at_depth_limit = task.depth >= ctx.max_depth
+        at_task_limit = ctx.task_limit_reached
+
+        if len(batches) <= 1 or at_depth_limit or at_task_limit:
+            chosen = batches[0] if batches else []
+            finding = await self._extract_root_causes_batch(
+                question, chosen, batch_index=0, ctx=ctx
+            )
+            if finding is None:
+                task.status = ResearchStatus.FAILED
+                return task
+
+            for assertion in finding.root_causes:
+                ctx.claims.append(
+                    Claim(
+                        subject=assertion.incident_id,
+                        attribute="root_cause",
+                        value=assertion.cause,
+                        chunk_ids=assertion.chunk_ids,
+                    )
+                )
+
+            summary = (
+                finding.summary
+                if finding.relevant
+                else f"Not relevant to payment outages: {finding.summary}"
+            )
+            if len(batches) > 1:
+                summary += " (evidence truncated: recursion/task budget reached)"
+
+            task.status = ResearchStatus.COMPLETED
+            task.result = ResearchResult(
+                task_id=task.task_id, summary=summary, evidence=_to_evidence(chosen)
+            )
+            return task
+
+        child_tasks: list[ResearchTask] = []
+        for batch_index, batch in enumerate(batches):
+            if ctx.task_limit_reached:
+                break
+            child = ResearchTask(
+                task_id=f"{task.task_id}-b{batch_index}",
+                question=task.question,
+                document_ids=tuple(c.chunk_id for c in batch),
+                parent_task_id=task.task_id,
+                depth=task.depth + 1,
+            )
+            ctx.tasks.append(child)
+            _emit(
+                ctx,
+                "task_created",
+                {
+                    "task_id": child.task_id,
+                    "parent_task_id": task.task_id,
+                    "depth": child.depth,
+                    "document_count": len(child.document_ids),
+                },
+            )
+            resolved_child = await self._process_incident_task(
+                child, question, evidence_index, ctx
+            )  # recursion
+            child_tasks.append(resolved_child)
+
+        aggregated = await self._aggregate(task, child_tasks, ctx)
+        task.status = ResearchStatus.COMPLETED if aggregated is not None else ResearchStatus.FAILED
+        task.result = aggregated
+        _emit(
+            ctx,
+            "aggregation",
+            {"task_id": task.task_id, "child_count": len(child_tasks), "status": task.status.value},
+        )
+        return task
+
+    # ------------------------------------------------------------------
+    # Stage 6: identify recurring patterns (Python Analysis Tool)
+    # ------------------------------------------------------------------
+
+    async def _identify_recurring_patterns(
+        self, claims: Sequence[Claim], roles: Sequence[Role], ctx: _RunContext
+    ) -> tuple[list[RecurringRootCause], str | None]:
+        """Deterministic frequency counting over VERIFIED root-cause claims,
+        via `src.tools.analysis.run_analysis` — never an LLM guess. One
+        claim per incident is counted (first one seen), so a single
+        incident can never itself inflate a "recurring" count.
+
+        Returns `(recurring_causes, skip_reason)`; `skip_reason` is set
+        (and `recurring_causes` empty) when there is nothing to count or
+        the caller's role lacks `Permission.ANALYTICS` — the workflow
+        degrades gracefully rather than bypassing authorization to run the
+        tool anyway.
+        """
+        root_cause_claims = [c for c in claims if c.attribute.strip().lower() == "root_cause"]
+        if not root_cause_claims:
+            return [], None
+
+        per_incident_norm: dict[str, str] = {}
+        display_by_norm: dict[str, str] = {}
+        for claim in root_cause_claims:
+            incident_id = claim.subject.strip()
+            cause_norm = claim.value.strip().lower()
+            per_incident_norm.setdefault(incident_id, cause_norm)
+            display_by_norm.setdefault(cause_norm, claim.value.strip())
+
+        role = _select_analytics_role(roles)
+        if role is None:
+            log_warning(
+                _logger,
+                "research.analytics_permission_denied",
+                "Recurring-pattern analysis skipped — no held role has analytics permission",
+                conversation_id=ctx.conversation_id,
+            )
+            return [], (
+                "Recurring-pattern analysis was skipped: no held role has analytics permission."
+            )
+
+        request = AnalysisRequest(
+            operation=AnalysisOperation.COUNT_BY,
+            data=[
+                {"incident_id": iid, "root_cause": cause}
+                for iid, cause in per_incident_norm.items()
+            ],
+            parameters={"field": "root_cause"},
+        )
+        try:
+            analysis_result = await run_analysis(request, role=role)
+        except Exception as exc:
+            log_error(
+                _logger,
+                "research.analytics_error",
+                "Python Analysis Tool call failed during recurring-pattern detection",
+                error=exc,
+                conversation_id=ctx.conversation_id,
+            )
+            return [], "Recurring-pattern analysis failed and was skipped."
+
+        ctx.budget = ctx.budget.consume(tool_calls=1)
+        counts: dict[str, int] = analysis_result.result["counts"]
+
+        recurring: list[RecurringRootCause] = []
+        for cause_norm, count in counts.items():
+            if count < RECURRING_THRESHOLD:
+                continue
+            incident_ids = tuple(
+                sorted(iid for iid, c in per_incident_norm.items() if c == cause_norm)
+            )
+            recurring.append(
+                RecurringRootCause(
+                    root_cause=display_by_norm[cause_norm],
+                    count=count,
+                    incident_ids=incident_ids,
+                )
+            )
+
+        recurring.sort(key=lambda r: (-r.count, r.root_cause))
+        _emit(
+            ctx,
+            "recurring_patterns",
+            {
+                "recurring_cause_count": len(recurring),
+                "incidents_considered": len(per_incident_norm),
+            },
+        )
+        return recurring, None
+
+    # ------------------------------------------------------------------
+    # Stage 9: generate final answer
+    # ------------------------------------------------------------------
+
+    async def _generate_incident_final_answer(
+        self,
+        question: str,
+        aggregated_summary: str,
+        recurring: list[RecurringRootCause],
+        supporting_document_ids: tuple[str, ...],
+        unverified_count: int,
+        analytics_skip_reason: str | None,
+        ctx: _RunContext,
+    ) -> IncidentAnalysisResult:
+        recurring_lines = [
+            f"{r.root_cause}: {r.count} incidents ({', '.join(r.incident_ids)})" for r in recurring
+        ]
+        facts: list[str] = [f"Supporting documents reviewed: {len(supporting_document_ids)}"]
+        if unverified_count:
+            facts.append(f"Unverified claims excluded: {unverified_count}")
+        if analytics_skip_reason:
+            facts.append(analytics_skip_reason)
+
+        # Every number the LLM is permitted to state — its own summary is
+        # rejected below if it states any number outside this set. Includes
+        # both verified statistics AND numbers that legitimately appear in
+        # the question or a known ID (a year, a case number) so restating
+        # those is never mistaken for an invented statistic — see
+        # `_unsupported_numbers`.
+        allowed_numbers = {str(r.count) for r in recurring}
+        allowed_numbers |= {str(len(r.incident_ids)) for r in recurring}
+        allowed_numbers |= {str(len(supporting_document_ids)), str(len(recurring))}
+        allowed_numbers |= {str(unverified_count)} if unverified_count else set()
+        allowed_numbers |= _numbers_in(question)
+        for cause in recurring:
+            for incident_id in cause.incident_ids:
+                allowed_numbers |= _numbers_in(incident_id)
+        for document_id in supporting_document_ids:
+            allowed_numbers |= _numbers_in(document_id)
+
+        synthesis = await self._call_structured(
+            system_prompt=build_incident_final_answer_prompt(
+                question, aggregated_summary, recurring_lines, list(supporting_document_ids), facts
+            ),
+            user_content=f"Write the final narrative summary for: {question}",
+            tool=_INCIDENT_FINAL_ANSWER_TOOL,
+            tool_name="incident_final_answer",
+            model_cls=IncidentFinalAnswer,
+            ctx=ctx,
+        )
+
+        extra_limitations: list[str] = [
+            "Document date ranges (e.g. a stated year) were not independently "
+            "verified against document metadata; results rely on retrieval "
+            "relevance and the evidence text itself."
+        ]
+        if analytics_skip_reason:
+            extra_limitations.append(analytics_skip_reason)
+        if unverified_count:
+            extra_limitations.append(
+                f"{unverified_count} extracted claim(s) could not be verified against "
+                "authorized evidence and were excluded from all counts."
+            )
+        if not recurring:
+            extra_limitations.append(
+                "No root cause recurred across more than one incident in the evidence examined."
+            )
+
+        if synthesis is None:
+            summary = _build_fallback_summary(recurring, supporting_document_ids)
+            limitations = " ".join(extra_limitations) or "Final synthesis could not be generated."
+        else:
+            bad_numbers = _unsupported_numbers(synthesis.summary, allowed_numbers)
+            if bad_numbers:
+                log_warning(
+                    _logger,
+                    "research.unsupported_statistic_blocked",
+                    "Final summary stated unverified figures; replaced with a deterministic one",
+                    bad_numbers=bad_numbers,
+                    conversation_id=ctx.conversation_id,
+                )
+                summary = _build_fallback_summary(recurring, supporting_document_ids)
+                extra_limitations.append(
+                    f"The narrative summary was replaced because it stated figures "
+                    f"({', '.join(bad_numbers)}) not present in the verified data."
+                )
+            else:
+                summary = synthesis.summary
+
+            limitations = synthesis.limitations
+            if extra_limitations:
+                limitations = f"{limitations} {' '.join(extra_limitations)}".strip()
+
+        return IncidentAnalysisResult(
+            summary=summary,
+            recurring_root_causes=tuple(recurring),
+            supporting_document_ids=supporting_document_ids,
+            limitations=limitations,
+            unverified_claim_count=unverified_count,
+        )
+
+    # ------------------------------------------------------------------
+    # Public entry point for the demonstration workflow
+    # ------------------------------------------------------------------
+
+    async def analyze_incident_root_causes(
+        self,
+        *,
+        question: str,
+        roles: Sequence[Role],
+        budget: ExecutionBudget,
+        conversation_id: str | None = None,
+        document_type: str | None = "incident_report",
+    ) -> IncidentAnalysisResult:
+        """Recursive incident root-cause analysis — the RLM demonstration
+        workflow (see docs/rlm.md): discover -> filter by authorization ->
+        partition -> analyze batches independently -> extract root causes
+        -> identify recurring patterns -> aggregate -> verify evidence ->
+        generate final answer.
+
+        Unlike `run()`, this does not read from a `GraphState` — it takes
+        exactly what it needs (question, roles, budget) so it can be
+        invoked directly for this specific query, e.g. from a script or a
+        test, without constructing a full chat turn.
+        """
+        ctx = _RunContext(
+            conversation_id=conversation_id,
+            budget=budget,
+            max_depth=budget.max_research_depth,
+            max_total_tasks=self._max_total_tasks,
+        )
+
+        if budget.is_exhausted:
+            log_warning(
+                _logger,
+                "research.budget_exhausted",
+                "Incident analysis skipped — execution budget already exhausted",
+                conversation_id=conversation_id,
+            )
+            return IncidentAnalysisResult(
+                summary="Analysis could not run: execution budget already exhausted.",
+                limitations="No analysis was performed because the execution budget was exhausted.",
+            )
+
+        # --- Stage 1: discover relevant documents --------------------------
+        pool = await self._discover_documents([question], roles, ctx, document_type=document_type)
+        if not pool:
+            return IncidentAnalysisResult(
+                summary="No relevant documents were found for this query.",
+                limitations="The knowledge base returned no matching documents.",
+            )
+
+        # --- Stage 2: filter by authorization -------------------------------
+        authorized, rejected = _filter_by_authorization(pool, roles=roles)
+        _emit(
+            ctx,
+            "authorization_filter",
+            {"authorized_count": len(authorized), "rejected_count": len(rejected)},
+        )
+        if not authorized:
+            return IncidentAnalysisResult(
+                summary="No authorized evidence was found for this query.",
+                limitations=(
+                    f"{len(rejected)} document(s) were found but excluded because the "
+                    "requesting user's role does not permit access to them."
+                ),
+            )
+
+        authorized_index = {ev.chunk_id: ev for ev in authorized}
+
+        # --- Stages 3-7: partition, analyze independently, aggregate -------
+        root_task = ResearchTask(
+            task_id="incident-root", question=question, document_ids=tuple(authorized_index)
+        )
+        ctx.tasks.append(root_task)
+        resolved_root = await self._process_incident_task(
+            root_task, question, authorized_index, ctx
+        )
+        aggregated_summary = (
+            resolved_root.result.summary
+            if resolved_root.result is not None
+            else "No summary could be produced from the retrieved evidence."
+        )
+
+        # --- Stage 8 (run before counting, so counts are always built from
+        # verified data only — see `_verify_claims` docstring) -------------
+        verified_claims, unverified_count = _verify_claims(ctx.claims, authorized_index)
+        _emit(
+            ctx,
+            "verify_evidence",
+            {"verified_count": len(verified_claims), "unverified_count": unverified_count},
+        )
+
+        # --- Stage 6: identify recurring patterns ---------------------------
+        recurring, analytics_skip_reason = await self._identify_recurring_patterns(
+            verified_claims, roles, ctx
+        )
+
+        supporting_document_ids = tuple(
+            sorted(
+                {
+                    authorized_index[cid].document_id
+                    for claim in verified_claims
+                    for cid in claim.chunk_ids
+                    if cid in authorized_index
+                }
+            )
+        )
+
+        # --- Stage 9: generate final answer ----------------------------------
+        result = await self._generate_incident_final_answer(
+            question,
+            aggregated_summary,
+            recurring,
+            supporting_document_ids,
+            unverified_count,
+            analytics_skip_reason,
+            ctx,
+        )
+
+        log_info(
+            _logger,
+            "research.incident_analysis_completed",
+            "Incident root-cause analysis completed",
+            total_tasks=len(ctx.tasks),
+            recurring_cause_count=len(recurring),
+            supporting_document_count=len(supporting_document_ids),
+            unverified_claim_count=unverified_count,
+            conversation_id=conversation_id,
+        )
+
+        return result
 
 
 # ---------------------------------------------------------------------------

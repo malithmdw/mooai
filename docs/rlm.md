@@ -207,6 +207,84 @@ The point of the example is what the final synthesis call's prompt
 short summaries and one contradiction sentence, regardless of whether the
 underlying pool had 3 chunks or 300.
 
+## The incident root-cause analysis workflow
+
+`ResearchAgent.analyze_incident_root_causes` (`src/agents/research/node.py`)
+extends the general pipeline above for a specific demonstration query:
+
+> "Summarize all payment outages related to payment failures during 2025
+> and identify recurring root causes."
+
+It reuses the general pipeline's primitives — `_partition_into_batches`,
+`_call_structured`, `_aggregate`, the depth/task budget guards — but adds
+three things the general pipeline does not have, and enforces a stricter
+output contract.
+
+**Stages** (its own numbering, not identical to the nine above — see the
+method's docstring for the full mapping):
+
+1. **Discover relevant documents** — `_discover_documents`, this time with
+   a `document_type` filter (defaults to `"incident_report"`) so discovery
+   is scoped to the right corpus from the start.
+2. **Filter by authorization** — `_filter_by_authorization`, an *explicit,
+   separately-audited* re-check with its own `authorization_filter`
+   `AgentEvent`. `HybridRetriever.search` already RBAC-filters by role
+   internally (twice); this stage applies the same authoritative filter
+   again, this time also constrained by access level, so the authorization
+   boundary is visible in this workflow's trace, not just enforced
+   silently inside the retriever — defense in depth (CLAUDE.md).
+3–5. **Partition, analyze batches independently, extract root causes** —
+   `_process_incident_task`, a recursive sibling of `_process_task` with
+   the same depth/task budget guards, but its leaf step
+   (`_extract_root_causes_batch`) uses a specialized prompt and tool
+   (`incident_root_causes`) that asks only for root causes, and can
+   honestly report `relevant: false` for a batch that isn't about a
+   payment outage at all rather than forcing one out.
+6. **Identify recurring patterns** — `_identify_recurring_patterns`. This
+   is the one stage backed by the **Python Analysis Tool**
+   (`src.tools.analysis.run_analysis`, `COUNT_BY`): one root-cause claim
+   per incident is counted deterministically, never estimated by the LLM.
+   If the requesting user's roles don't include one with
+   `Permission.ANALYTICS`, this stage is skipped — not bypassed — and the
+   final answer says so explicitly (see CLAUDE.md "Agents must never
+   bypass application authorization").
+7. **Aggregate results** — the general pipeline's `_aggregate`, reused
+   as-is (it just combines `(task_id, summary)` pairs, which is domain
+   agnostic).
+8. **Verify evidence** — `_verify_claims`, run *before* Stage 6's counting
+   (not literally last), so recurring-cause counts are only ever built
+   from claims whose `chunk_ids` are actually present in the authorized
+   evidence pool. A claim citing a chunk that was never retrieved — a
+   hallucination — is dropped before it can inflate a count or appear in
+   `supporting_document_ids`, and the drop is reflected in
+   `unverified_claim_count` and the final `limitations` text.
+9. **Generate final answer** — `_generate_incident_final_answer`. The LLM
+   (`incident_final_answer` tool) supplies only `summary` prose and
+   `limitations`; `recurring_root_causes` and `supporting_document_ids` are
+   always attached by code from verified, counted data, never copied from
+   model output (`IncidentFinalAnswer` doesn't even have fields for them).
+
+### Do not allow unsupported statistical claims
+
+This requirement is enforced twice, by construction rather than by
+instruction alone:
+
+1. **The LLM never produces a number that matters.** `RecurringRootCause`
+   (`count`, `incident_ids`) comes entirely from
+   `_identify_recurring_patterns`'s `Counter`-based tally; the model's
+   `incident_final_answer` call only ever narrates figures it is handed
+   verbatim in the prompt.
+2. **A deterministic guard checks the narrative anyway.**
+   `_unsupported_numbers` scans the model's `summary` for any standalone
+   digit sequence and rejects the response if it states a number outside
+   an `allowed` set built from the verified counts *and* every number that
+   legitimately appears in the question or a known incident/document ID
+   (so restating "2025", or an incident id like `INC-2025-001`, is never
+   mistaken for an invented statistic). A rejected summary is replaced by
+   `_build_fallback_summary` — a template built only from verified data,
+   the same "safe, verified content only" pattern as
+   `SAFE_FAILURE_RESPONSE` in `src.agents.guardrails.citation_validation`.
+
 ## Why this qualifies as RLM-style, not repeated LLM calls
 
 A flat "repeated LLM calls" approach would retrieve documents and then loop
@@ -254,16 +332,22 @@ This implementation differs in the ways that matter:
 | The Research Agent is not yet wired into `ChatService`'s live LangGraph (`src/services/chat.py`) | Matches this project's established pattern: the Supervisor, Retrieval, and Response agents were each built and tested standalone before a later commit wired them together (see CLAUDE.md "Foundation before features"); wiring the Research Agent in — including the supervisor's existing `route_to: "research"` decision — is the natural next step |
 | No mid-run persistence: if the process crashes mid-recursion, the partial task tree is lost | `GraphState` (and therefore `research_tasks`) is only returned once `run()` completes; LangGraph checkpointing (`src/memory/checkpoint.py`) persists *between* graph nodes, not within one node's internal recursion |
 | A task truncated by the depth/task budget silently drops the remaining batches' evidence (beyond noting the truncation in its summary) | The alternative — refusing to answer — is worse for a research assistant; the truncation is explicit in both the result text and a `research.truncated` log line, never silent |
+| The incident workflow's Stage 1 uses a single discovery query (the raw question), not the general pipeline's LLM-driven search-plan expansion | Keeps the workflow's LLM call count minimal and matches its own numbered spec, which starts at "discover documents"; recall could be improved by reusing `_build_search_plan` at the cost of an extra LLM call |
+| `supporting_document_ids` and `unverified_claim_count` are derived from *all* verified claims, not exclusively root-cause claims | The aggregation step's generic `research_finding` call can add incidental, non-root-cause claims to the same shared `ctx.claims` list; including them is the more conservative (over-disclosing, not under-disclosing) choice for a "supporting documents reviewed" figure |
+| The incident workflow does not independently verify that a document's `created_date` falls inside the query's stated time range (e.g. "during 2025") | It relies on retrieval relevance and the LLM's own reading of document content; the final answer's `limitations` should note this, and a dedicated date-filter stage (mirroring `_filter_by_authorization`) is a natural follow-up |
 
 ## File inventory
 
 | File | Role |
 |------|------|
-| `src/agents/research/node.py` | `ResearchAgent`, `make_research_node`, all nine pipeline stages |
-| `src/agents/research/models.py` | `QuestionAnalysis`, `Claim`, `ResearchFinding`, `Contradiction`, `FinalSynthesis`, `ResearchConfidence` |
-| `src/agents/research/prompts.py` | System prompts for stages 1, 6, 7, 9 — all evidence blocks are bounded and XML-delimited as untrusted data |
+| `src/agents/research/node.py` | `ResearchAgent`, `make_research_node`, all nine general pipeline stages, and `analyze_incident_root_causes` (the incident workflow) |
+| `src/agents/research/models.py` | General: `QuestionAnalysis`, `Claim`, `ResearchFinding`, `Contradiction`, `FinalSynthesis`, `ResearchConfidence`. Incident workflow: `RootCauseAssertion`, `IncidentRootCauseFinding`, `RecurringRootCause`, `IncidentFinalAnswer`, `IncidentAnalysisResult` |
+| `src/agents/research/prompts.py` | System prompts for stages 1, 6, 7, 9, plus the incident workflow's batch-extraction and final-answer prompts — all evidence blocks are bounded and XML-delimited as untrusted data |
 | `src/models/research.py` | `ResearchTask`, `ResearchResult` — the explicit state |
 | `src/agents/budget.py` | `ExecutionBudget.max_research_depth` / `used_research_steps` — the depth budget |
 | `src/agents/state.py` | `GraphState.research_tasks` / `research_results` fields |
-| `tests/agents/test_research.py` | Full pipeline tests, including the payment-incident worked example |
+| `src/tools/analysis.py` | `run_analysis` (`COUNT_BY`) — the Python Analysis Tool backing Stage 6 of the incident workflow |
+| `src/retrieval/hybrid/filtering.py` | `apply_access_filter` — reused by the incident workflow's explicit authorization stage |
+| `tests/agents/test_research.py` | General pipeline tests, including the payment-incident worked example |
+| `tests/agents/test_incident_analysis.py` | Incident workflow end-to-end tests, using a synthetic 2025 payment-incident dataset |
 | `tests/models/test_research.py` | `ResearchTask` / `ResearchResult` model tests |
