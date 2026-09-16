@@ -1,0 +1,53 @@
+{
+  "document_id": "INC-2024-001",
+  "title": "Payment Gateway Timeout Cascade — Visa Debit Processing Outage",
+  "department": "Payments Engineering",
+  "document_type": "incident_report",
+  "access_level": "INTERNAL",
+  "created_date": "2024-01-15",
+  "allowed_roles": ["ENGINEER", "ANALYST", "ADMINISTRATOR"],
+  "severity": "P1",
+  "status": "Resolved",
+  "duration_minutes": 47,
+  "affected_systems": ["payment-gateway", "visa-processor", "transaction-ledger", "notification-service"],
+  "content": {
+    "summary": "A connection pool exhaustion on the Visa debit processing adapter caused a cascade of timeouts across the payment gateway, resulting in 12,400 failed card-present transactions between 14:03 and 14:50 UTC on 2024-01-15.",
+    "timeline": [
+      {"time": "14:03 UTC", "event": "Alerting fires: payment-gateway p99 latency > 8 s (threshold 3 s)"},
+      {"time": "14:07 UTC", "event": "On-call engineer pages; visa-processor connection pool at 100 % utilisation"},
+      {"time": "14:12 UTC", "event": "Incident declared P1; war-room opened in #incident-p1 Slack channel"},
+      {"time": "14:19 UTC", "event": "Root cause identified: database certificate rotation had not propagated to visa-processor pod secrets"},
+      {"time": "14:31 UTC", "event": "Secret updated; rolling restart of visa-processor initiated"},
+      {"time": "14:50 UTC", "event": "All pods healthy; transaction success rate restored to 99.97 %"}
+    ],
+    "root_cause": "The automated certificate rotation job (cert-rotator v2.3.1) updated the PostgreSQL TLS certificate in Vault but the Kubernetes ExternalSecret operator failed to sync the new version to the visa-processor namespace due to a misconfigured sync interval (value was 0 instead of 300 s). As visa-processor pods attempted to reconnect with the expired certificate, connections were rejected, exhausting the pool and triggering cascading timeouts in the upstream payment-gateway.",
+    "contributing_factors": [
+      "cert-rotator did not emit a structured log on sync failure — only a warning-level unstructured message that was not captured by the alerting pipeline",
+      "No canary health check existed for database connectivity independent of live traffic",
+      "Connection pool size (50 connections) was not auto-scaled under load"
+    ],
+    "impact": {
+      "failed_transactions": 12400,
+      "estimated_revenue_loss_gbp": 186000,
+      "customer_complaints": 341,
+      "regulatory_notification_required": false
+    },
+    "remediation": {
+      "immediate": [
+        "Manually sync ExternalSecret in visa-processor namespace",
+        "Rolling restart of all visa-processor pods"
+      ],
+      "short_term": [
+        "Fix ExternalSecret syncInterval from 0 to 300 s (PR #4412)",
+        "Add cert-rotator structured logging for sync failures (JIRA PAY-8821)"
+      ],
+      "long_term": [
+        "Implement synthetic canary transactions for database connectivity (JIRA PAY-8830)",
+        "Add connection pool autoscaling policy (JIRA PAY-8831)",
+        "Integrate cert-rotation status into payment gateway readiness probe"
+      ]
+    },
+    "related_incidents": ["INC-2023-047", "INC-2024-008"],
+    "related_documents": ["ARCH-003", "RUN-002", "POL-005"]
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "document_id": "INC-2024-013",
+  "title": "Cheque Imaging Service Unavailability — Delayed Clearing Cycle",
+  "department": "Payments Engineering",
+  "document_type": "incident_report",
+  "access_level": "INTERNAL",
+  "created_date": "2024-08-12",
+  "allowed_roles": ["ENGINEER", "ANALYST", "ADMINISTRATOR"],
+  "severity": "P2",
+  "status": "Resolved",
+  "duration_minutes": 180,
+  "affected_systems": ["cheque-imaging-service", "image-clearing-gateway", "core-banking-ledger"],
+  "content": {
+    "summary": "The cheque imaging service became unavailable on 2024-08-12 due to object storage quota exhaustion, delaying the morning clearing cycle by 3 hours and affecting 4,200 cheques with a total value of GBP 18.7 M.",
+    "timeline": [
+      {"time": "06:00 UTC", "event": "Morning cheque clearing cycle begins; cheque-imaging-service starts uploading to object storage"},
+      {"time": "06:04 UTC", "event": "Object storage quota exceeded (100 GB limit); uploads fail"},
+      {"time": "06:08 UTC", "event": "cheque-imaging-service enters degraded state; image-clearing-gateway queues backlogged"},
+      {"time": "07:15 UTC", "event": "P2 declared; storage team identifies expired cheque images not purged"},
+      {"time": "08:30 UTC", "event": "Storage purge of images older than 90 days completes; quota freed"},
+      {"time": "09:00 UTC", "event": "Clearing cycle resumed; all 4,200 cheques processed"}
+    ],
+    "root_cause": "A lifecycle policy that automatically purged cheque images older than 90 days was disabled 45 days prior when it incorrectly deleted a batch of images under a legal hold. The policy was not re-enabled after the legal hold investigation completed, leading to gradual storage accumulation until quota was exhausted.",
+    "contributing_factors": [
+      "Lifecycle policy re-enablement not tracked as a formal task after legal hold investigation",
+      "No storage usage alert configured below the 100% threshold",
+      "Image-clearing-gateway had no fallback processing path for storage unavailability"
+    ],
+    "impact": {
+      "cheques_affected": 4200,
+      "total_value_gbp": 18700000,
+      "clearing_delay_hours": 3,
+      "regulatory_notification_required": true,
+      "regulatory_body": "PSR (Payment Systems Regulator)"
+    },
+    "remediation": {
+      "immediate": [
+        "Manually purge cheque images older than 90 days (excluding legal hold items)",
+        "Re-enable lifecycle policy with legal-hold exemption filter"
+      ],
+      "short_term": [
+        "Add storage usage alert at 75 % and 90 % thresholds (JIRA OPS-2250)",
+        "Implement formal legal-hold policy with automatic re-enable tracking (JIRA LEGAL-88)",
+        "Increase object storage quota from 100 GB to 500 GB (JIRA INFRA-340)"
+      ],
+      "long_term": [
+        "Migrate cheque imaging to auto-scaling object storage tier",
+        "Implement image-clearing-gateway graceful degradation with local buffer",
+        "Annual storage capacity planning review"
+      ]
+    },
+    "related_incidents": [],
+    "related_documents": ["ARCH-002", "RUN-004", "POL-004"]
+  }
+}

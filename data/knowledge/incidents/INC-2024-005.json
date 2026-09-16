@@ -1,0 +1,54 @@
+{
+  "document_id": "INC-2024-005",
+  "title": "Sanctions Screening Service OOM Crash — Payment Processing Stall",
+  "department": "Compliance Technology",
+  "document_type": "incident_report",
+  "access_level": "RESTRICTED",
+  "created_date": "2024-03-19",
+  "allowed_roles": ["ANALYST", "ADMINISTRATOR"],
+  "severity": "P1",
+  "status": "Resolved",
+  "duration_minutes": 61,
+  "affected_systems": ["sanctions-screening", "payment-gateway", "wire-transfer-service", "fps-connector"],
+  "content": {
+    "summary": "The sanctions-screening service crashed with an out-of-memory (OOM) error at 09:17 UTC on 2024-03-19 after a daily list update loaded the full OFAC SDN list into JVM heap without chunking. Because the payment gateway enforces a hard dependency on sanctions clearance, all payment processing stalled for 61 minutes.",
+    "timeline": [
+      {"time": "09:00 UTC", "event": "Scheduled daily OFAC SDN list refresh begins downloading and parsing 1.4 GB XML file"},
+      {"time": "09:17 UTC", "event": "sanctions-screening JVM OOM error; pod crashes and enters CrashLoopBackOff"},
+      {"time": "09:19 UTC", "event": "payment-gateway detects sanctions-screening unavailable; activates HOLD_PAYMENTS circuit"},
+      {"time": "09:23 UTC", "event": "P1 declared; compliance team and platform engineering paged"},
+      {"time": "09:51 UTC", "event": "Hotfix deployed: list loader updated to stream-parse XML in 50 MB chunks"},
+      {"time": "10:18 UTC", "event": "sanctions-screening healthy; payment-gateway HOLD_PAYMENTS circuit released"}
+    ],
+    "root_cause": "The OFAC SDN list update routine (updated 2024-03-18 to accommodate a larger list format) loaded the entire 1.4 GB XML document into memory as a DOM tree before processing. The sanctions-screening pod had a JVM heap limit of 512 MB set in the Kubernetes resource manifest. The prior SDN list was 380 MB and fit within the heap limit; the updated list exceeded it.",
+    "contributing_factors": [
+      "Memory limit not revised when SDN list format was updated (configuration drift)",
+      "No memory stress test run against new SDN list format before deployment",
+      "Payment gateway HOLD_PAYMENTS circuit correctly activated but had no partial-clearance fallback for low-risk domestic payments"
+    ],
+    "impact": {
+      "payments_held": 18400,
+      "duration_minutes": 61,
+      "regulatory_risk": "HIGH — payment processing halt could trigger PRA notification if > 2 hours",
+      "regulatory_notification_required": false
+    },
+    "remediation": {
+      "immediate": [
+        "Hotfix: stream-parse SDN XML in chunks (JIRA COMP-501)",
+        "Increase JVM heap limit to 2 GB as interim measure"
+      ],
+      "short_term": [
+        "Replace DOM parsing with StAX streaming parser (JIRA COMP-502)",
+        "Add memory load test to CI pipeline for sanctions-screening (JIRA COMP-503)",
+        "Implement risk-stratified payment clearance: allow low-value domestic payments via cached list during list refresh (JIRA PAY-9120)"
+      ],
+      "long_term": [
+        "Migrate SDN list storage to an incrementally-updatable graph database",
+        "Introduce sanctions-screening service mesh with blue-green list refresh",
+        "Define explicit SLO for sanctions clearance availability (ref: POL-008)"
+      ]
+    },
+    "related_incidents": ["INC-2024-010"],
+    "related_documents": ["ARCH-006", "POL-008", "RUN-009"]
+  }
+}

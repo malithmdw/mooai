@@ -1,0 +1,56 @@
+{
+  "document_id": "INC-2024-010",
+  "title": "Sanctions Screening Database Corruption — Partial List Serving After Upgrade",
+  "department": "Compliance Technology",
+  "document_type": "incident_report",
+  "access_level": "RESTRICTED",
+  "created_date": "2024-06-05",
+  "allowed_roles": ["ANALYST", "ADMINISTRATOR"],
+  "severity": "P1",
+  "status": "Resolved",
+  "duration_minutes": 52,
+  "affected_systems": ["sanctions-screening", "payment-gateway", "wire-transfer-service"],
+  "content": {
+    "summary": "Following a database schema migration on 2024-06-05, the sanctions screening service served a partial (31%) version of the OFAC SDN list for 52 minutes due to a migration rollback that did not re-seed the new schema with the full dataset.",
+    "timeline": [
+      {"time": "02:00 UTC", "event": "Planned schema migration begins on sanctions-screening database"},
+      {"time": "02:41 UTC", "event": "Migration encounters index creation timeout; partial rollback triggered"},
+      {"time": "02:43 UTC", "event": "Rollback completes but database contains only the first 31% of SDN entries (seeding was not re-run)"},
+      {"time": "03:15 UTC", "event": "Compliance monitoring alert: SDN entry count below threshold (expected 14,800; found 4,600)"},
+      {"time": "03:22 UTC", "event": "P1 declared; wire-transfer-service suspended pending full list validation"},
+      {"time": "04:07 UTC", "event": "Full SDN list re-seeded; all payment processing resumed"}
+    ],
+    "root_cause": "The migration rollback script was designed to restore schema DDL only, not data. After rollback, the database had the old schema with only partially migrated data. The data seeding step was part of the forward migration path and was not included in the rollback path. This is a known gap identified in INC-2024-005's long-term remediation backlog but not yet addressed.",
+    "contributing_factors": [
+      "Migration rollback script did not include data integrity verification step",
+      "SDN entry count check was not part of the post-migration smoke test",
+      "Related to INC-2024-005 — repeated pattern of sanctions list integrity issues"
+    ],
+    "impact": {
+      "screening_degradation_minutes": 52,
+      "payments_processed_with_partial_list": 1240,
+      "transactions_requiring_re-screening": 1240,
+      "regulatory_notification_required": true,
+      "regulatory_body": "FCA / OFSI"
+    },
+    "remediation": {
+      "immediate": [
+        "Suspend wire-transfer-service",
+        "Re-seed full SDN list from authoritative source",
+        "Re-screen all 1,240 payments processed during partial-list window"
+      ],
+      "short_term": [
+        "Add SDN entry count assertion to post-migration smoke test (JIRA COMP-520)",
+        "Include data integrity check in all rollback scripts (JIRA COMP-521)",
+        "Implement pre- and post-migration SDN count comparison gate (JIRA COMP-522)"
+      ],
+      "long_term": [
+        "Migrate SDN list to append-only immutable storage with versioned snapshots",
+        "Blue-green deployment model for sanctions database migrations",
+        "Automated re-screening workflow for payments in degraded-list windows"
+      ]
+    },
+    "related_incidents": ["INC-2024-005"],
+    "related_documents": ["ARCH-006", "POL-008", "RUN-009"]
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "document_id": "INC-2024-003",
+  "title": "Core Banking Ledger Replication Lag — Balance Inconsistency During Peak Hours",
+  "department": "Core Banking",
+  "document_type": "incident_report",
+  "access_level": "INTERNAL",
+  "created_date": "2024-02-20",
+  "allowed_roles": ["ENGINEER", "ANALYST", "ADMINISTRATOR"],
+  "severity": "P2",
+  "status": "Resolved",
+  "duration_minutes": 210,
+  "affected_systems": ["core-banking-ledger", "read-replica-cluster", "mobile-banking-api", "atm-network"],
+  "content": {
+    "summary": "Replication lag on the PostgreSQL read-replica cluster reached 45 minutes during the lunch-hour peak on 2024-02-20, causing mobile banking and ATM balance queries to return stale balances. Approximately 78,000 customers saw incorrect available balance figures.",
+    "timeline": [
+      {"time": "12:02 UTC", "event": "Replication lag monitoring alert fires at 5-minute lag threshold"},
+      {"time": "12:15 UTC", "event": "Lag reaches 15 minutes; mobile-banking-api begins serving stale balances"},
+      {"time": "12:41 UTC", "event": "Lag peaks at 45 minutes; 78,000 active sessions affected"},
+      {"time": "13:10 UTC", "event": "DBA team identifies long-running analytics query blocking vacuum on primary"},
+      {"time": "13:22 UTC", "event": "Analytics query terminated; replication begins catching up"},
+      {"time": "15:32 UTC", "event": "Replication lag returns to < 30 s; incident resolved"}
+    ],
+    "root_cause": "A newly deployed data-warehouse ETL job executed a 3-hour full-table scan on the core banking ledger's primary PostgreSQL instance without a statement_timeout. The scan prevented autovacuum from completing on the transactions table, causing WAL bloat that overwhelmed replication throughput to read replicas.",
+    "contributing_factors": [
+      "ETL job deployed to production without statement_timeout configuration",
+      "Analytics workloads not segregated from OLTP primary — no read-replica routing for analytics",
+      "Replication lag alerting threshold was 5 minutes (should have been 2 minutes for balance-sensitive paths)",
+      "Mobile-banking-api had no circuit breaker to fall back to primary reads on stale-data detection"
+    ],
+    "impact": {
+      "customers_affected": 78000,
+      "stale_balance_window_minutes": 210,
+      "overdraft_decisions_at_risk": 12,
+      "regulatory_notification_required": false
+    },
+    "remediation": {
+      "immediate": [
+        "Terminate long-running ETL query",
+        "Force manual vacuum on transactions table",
+        "Switch mobile-banking-api balance endpoint to read from primary temporarily"
+      ],
+      "short_term": [
+        "Add statement_timeout = 300 s to all ETL database roles (JIRA DB-441)",
+        "Route analytics ETL to a dedicated analytics replica (JIRA DB-442)",
+        "Lower replication lag alert threshold to 2 minutes (JIRA OPS-2215)"
+      ],
+      "long_term": [
+        "Implement read-your-writes consistency for mobile balance API",
+        "Introduce dedicated analytics PostgreSQL instance separate from OLTP cluster",
+        "Automated ETL query plan analysis before production deployment"
+      ]
+    },
+    "related_incidents": ["INC-2023-031", "INC-2024-012"],
+    "related_documents": ["ARCH-001", "RUN-003", "POL-002"]
+  }
+}

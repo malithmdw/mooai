@@ -1,0 +1,55 @@
+{
+  "document_id": "INC-2024-015",
+  "title": "Customer Data Export Timeout — GDPR Subject Access Request Backlog",
+  "department": "Data & Privacy",
+  "document_type": "incident_report",
+  "access_level": "INTERNAL",
+  "created_date": "2024-09-18",
+  "allowed_roles": ["ENGINEER", "ANALYST", "ADMINISTRATOR"],
+  "severity": "P3",
+  "status": "Resolved",
+  "duration_minutes": 2880,
+  "affected_systems": ["data-export-service", "core-banking-ledger", "gdpr-portal", "notification-service"],
+  "content": {
+    "summary": "The GDPR Subject Access Request (SAR) data export pipeline on 2024-09-18 timed out due to an unindexed query, causing a 48-hour backlog of 340 customer export requests and a compliance risk against the ICO's 30-day SAR response obligation.",
+    "timeline": [
+      {"time": "2024-09-18 09:00 UTC", "event": "Batch SAR export job begins processing 340 queued requests"},
+      {"time": "2024-09-18 09:14 UTC", "event": "Export job times out after 14 minutes (limit 10 minutes); first request fails"},
+      {"time": "2024-09-18 10:30 UTC", "event": "DPO notified by automated SAR-delay alert"},
+      {"time": "2024-09-18 14:00 UTC", "event": "Engineering team identifies missing composite index on customer_data_exports table"},
+      {"time": "2024-09-19 11:00 UTC", "event": "Index created; export pipeline re-run; all 340 requests processed"},
+      {"time": "2024-09-19 11:30 UTC", "event": "Customers notified; incident resolved"}
+    ],
+    "root_cause": "A new personalisation field added to the SAR export schema required a JOIN across three tables without a composite index on the primary filter columns (customer_id, export_date). For customers with > 5 years of transaction history, the query execution time exceeded the 10-minute timeout.",
+    "contributing_factors": [
+      "Schema change for SAR export not reviewed by DBA team before deployment",
+      "Export timeout not surfaced as a critical failure — failed silently until DPO alert fired",
+      "SAR backlog monitoring threshold was 24 hours (compliance risk is at 29 days)"
+    ],
+    "impact": {
+      "sar_requests_backlogged": 340,
+      "backlog_duration_hours": 48,
+      "compliance_risk": "ICO 30-day SAR response obligation",
+      "regulatory_notification_required": false,
+      "customers_at_risk": 340
+    },
+    "remediation": {
+      "immediate": [
+        "Create composite index on customer_data_exports(customer_id, export_date)",
+        "Re-run failed export batch"
+      ],
+      "short_term": [
+        "Add DBA review gate to all SAR schema changes (JIRA DATA-200)",
+        "Surface SAR export failures as P2 alerts (JIRA OPS-2260)",
+        "Add SAR backlog monitoring at 4-hour intervals (JIRA DATA-201)"
+      ],
+      "long_term": [
+        "Introduce pre-computed SAR export cache updated nightly",
+        "Annual GDPR data-flow mapping review",
+        "Automated SAR response time SLA monitoring dashboard"
+      ]
+    },
+    "related_incidents": ["INC-2024-003"],
+    "related_documents": ["POL-010", "ARCH-001", "RUN-003"]
+  }
+}

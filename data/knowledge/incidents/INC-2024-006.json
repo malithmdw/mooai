@@ -1,0 +1,56 @@
+{
+  "document_id": "INC-2024-006",
+  "title": "Mobile Banking API Authentication Token Leak via Verbose Error Response",
+  "department": "Digital Banking",
+  "document_type": "incident_report",
+  "access_level": "RESTRICTED",
+  "created_date": "2024-04-02",
+  "allowed_roles": ["ANALYST", "ADMINISTRATOR"],
+  "severity": "P1",
+  "status": "Resolved",
+  "duration_minutes": 29,
+  "affected_systems": ["mobile-banking-api", "auth-service", "api-gateway"],
+  "content": {
+    "summary": "A code change deployed on 2024-04-02 caused the mobile-banking-api to include raw JWT bearer tokens in HTTP 401 error response bodies when the token was malformed. The vulnerability was active for 29 minutes before detection and rollback. No evidence of exploitation was found during forensic review.",
+    "timeline": [
+      {"time": "10:04 UTC", "event": "Deployment of mobile-banking-api v3.8.1 completes"},
+      {"time": "10:06 UTC", "event": "Automated DAST scanner (OWASP ZAP) flags token-in-response-body on /api/v1/accounts endpoint"},
+      {"time": "10:11 UTC", "event": "Security team paged; investigation begins"},
+      {"time": "10:19 UTC", "event": "Rollback to v3.8.0 initiated"},
+      {"time": "10:33 UTC", "event": "Rollback complete; all instances confirmed running v3.8.0"}
+    ],
+    "root_cause": "A developer added debug logging to the JWT validation middleware for local troubleshooting but accidentally committed the change. The debug handler included the raw token value in the structured error object passed to the HTTP response serialiser. The code review did not catch the sensitive data exposure because the reviewer tested with valid tokens only and the vulnerable path was only triggered by malformed tokens.",
+    "contributing_factors": [
+      "JWT validation error handler was not covered by security unit tests",
+      "Pre-production DAST scan was skipped because the deployment was classified as 'minor' (< 50 lines changed)",
+      "No automated PII/credential detection in CI pipeline for HTTP response bodies"
+    ],
+    "impact": {
+      "vulnerability_active_minutes": 29,
+      "requests_in_window_count": 847,
+      "malformed_token_requests_count": 3,
+      "exploitation_evidence": "None found in access logs or SIEM",
+      "regulatory_notification_required": true,
+      "regulatory_body": "FCA / ICO (precautionary)"
+    },
+    "remediation": {
+      "immediate": [
+        "Rollback to v3.8.0",
+        "Rotate all JWT signing keys as precaution",
+        "Notify security team and begin forensic review"
+      ],
+      "short_term": [
+        "Add security unit test suite for all error handler paths (JIRA SEC-301)",
+        "Mandate DAST scan for all deployments regardless of change size (JIRA SEC-302)",
+        "Implement response body secret scanning in CI (JIRA SEC-303)"
+      ],
+      "long_term": [
+        "Introduce automated sensitive-data classifier on all API responses in staging",
+        "Add SAST rule for raw token/credential values in error handlers",
+        "Quarterly red-team review of authentication and error handling code paths"
+      ]
+    },
+    "related_incidents": [],
+    "related_documents": ["POL-007", "ARCH-005", "RUN-010"]
+  }
+}

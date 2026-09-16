@@ -1,0 +1,57 @@
+{
+  "document_id": "INC-2024-002",
+  "title": "SWIFT MT103 Message Duplication — Outbound Wire Transfer Double-Send",
+  "department": "Payments Engineering",
+  "document_type": "incident_report",
+  "access_level": "RESTRICTED",
+  "created_date": "2024-02-03",
+  "allowed_roles": ["ANALYST", "ADMINISTRATOR"],
+  "severity": "P1",
+  "status": "Resolved",
+  "duration_minutes": 134,
+  "affected_systems": ["swift-gateway", "wire-transfer-service", "transaction-ledger", "sanctions-screening"],
+  "content": {
+    "summary": "A retry-storm in the SWIFT message broker caused 38 outbound MT103 wire transfer messages to be submitted twice to the SWIFT network during a scheduled maintenance window on 2024-02-03. Duplicate payments totalling GBP 4.2 M were initiated before the duplicate-detection safeguard identified the anomaly.",
+    "timeline": [
+      {"time": "02:00 UTC", "event": "Planned maintenance: SWIFT gateway failover to DR node initiated"},
+      {"time": "02:14 UTC", "event": "Primary node handoff completes; DR node begins processing message queue"},
+      {"time": "02:17 UTC", "event": "DR node detects 38 messages with status PENDING_ACK from primary and re-submits them"},
+      {"time": "02:31 UTC", "event": "Automated duplicate-detection alerts: transaction-ledger sees 38 UETR collisions"},
+      {"time": "02:45 UTC", "event": "P1 declared; wire-transfer-service pause flag activated"},
+      {"time": "04:14 UTC", "event": "All duplicate payments recalled via SWIFT gpi; balances corrected"}
+    ],
+    "root_cause": "The SWIFT gateway's DR node lacked access to the shared idempotency store (Redis cluster in primary DC) during failover due to a network ACL that blocked cross-DC Redis traffic. Without idempotency checks, the DR node treated 38 messages still in PENDING_ACK status as unacknowledged and re-submitted them. The idempotency store is documented as a required dependency in ARCH-004 but the DR runbook (RUN-006) did not include a pre-failover connectivity check.",
+    "contributing_factors": [
+      "DR runbook missing Redis connectivity pre-check (gap identified in DR-test-2023-Q4 but not remediated)",
+      "SWIFT gateway DR node had no read access to the idempotency store during cross-DC failover",
+      "Duplicate-detection alert threshold set to 5 collisions; 38 occurred before human intervention"
+    ],
+    "impact": {
+      "duplicate_payments_count": 38,
+      "duplicate_payment_value_gbp": 4200000,
+      "all_payments_recalled": true,
+      "regulatory_notification_required": true,
+      "regulatory_body": "FCA",
+      "customer_impact": "38 corporate customers experienced temporary double-debit; corrected within 2 hours"
+    },
+    "remediation": {
+      "immediate": [
+        "Activate pause flag on wire-transfer-service",
+        "Issue SWIFT gpi recall for all 38 duplicate MTs",
+        "Manually reconcile transaction-ledger"
+      ],
+      "short_term": [
+        "Add cross-DC Redis replication for idempotency store (JIRA PAY-9001)",
+        "Update DR runbook RUN-006 with Redis connectivity pre-check (JIRA OPS-2210)",
+        "Lower duplicate-detection threshold from 5 to 1 collision (JIRA PAY-9002)"
+      ],
+      "long_term": [
+        "Implement active-active Redis across DCs for idempotency store",
+        "Quarterly DR failover drill with idempotency store validation",
+        "Automated DR readiness gate in failover pipeline"
+      ]
+    },
+    "related_incidents": ["INC-2024-007", "INC-2024-011"],
+    "related_documents": ["ARCH-004", "RUN-006", "POL-003"]
+  }
+}

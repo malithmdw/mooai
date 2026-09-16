@@ -1,0 +1,55 @@
+{
+  "document_id": "INC-2024-008",
+  "title": "Open Banking API Rate Limiter Misconfiguration — Third-Party Provider Lockout",
+  "department": "Open Banking",
+  "document_type": "incident_report",
+  "access_level": "INTERNAL",
+  "created_date": "2024-05-01",
+  "allowed_roles": ["ENGINEER", "ANALYST", "ADMINISTRATOR"],
+  "severity": "P2",
+  "status": "Resolved",
+  "duration_minutes": 76,
+  "affected_systems": ["open-banking-api", "api-gateway", "tpp-registry", "payment-initiation-service"],
+  "content": {
+    "summary": "A misconfigured rate limiter on the Open Banking API on 2024-05-01 set the per-TPP (Third-Party Provider) limit to 10 requests/minute instead of 10 requests/second, effectively locking out all registered TPPs for 76 minutes and blocking PSD2-compliant payment initiations.",
+    "timeline": [
+      {"time": "06:00 UTC", "event": "Scheduled rate-limiter config update deployed as part of PSD2 compliance enhancement"},
+      {"time": "06:01 UTC", "event": "TPPs begin receiving HTTP 429 Too Many Requests on first legitimate API call"},
+      {"time": "06:14 UTC", "event": "Three TPP partners raise P1 incidents with their bank contacts"},
+      {"time": "06:22 UTC", "event": "Platform team identifies rate limiter unit mismatch (requests/minute vs requests/second)"},
+      {"time": "07:01 UTC", "event": "Config corrected and deployed; TPP access restored"},
+      {"time": "07:16 UTC", "event": "All TPP error rates return to baseline; incident resolved"}
+    ],
+    "root_cause": "The rate limiter configuration file used a field named 'limit' which was interpreted as requests-per-minute by the new rate limiter version (v2.0) but had been requests-per-second in v1.x. The upgrade changelog documented this breaking change but the deployment engineer did not consult the migration guide. The value of 10 was not changed during the upgrade, causing a 60x reduction in effective throughput.",
+    "contributing_factors": [
+      "Rate limiter upgrade changelog not reviewed before deploying configuration change",
+      "No integration test covering TPP authentication and rate limit behaviour",
+      "Deployment window was 06:00 UTC — outside business hours, reducing response speed"
+    ],
+    "impact": {
+      "tpps_affected": 47,
+      "payment_initiations_blocked": 3200,
+      "duration_minutes": 76,
+      "psd2_compliance_breach": "Potential — PSD2 requires banks not to obstruct TPP access; under review by Open Banking team",
+      "regulatory_notification_required": false
+    },
+    "remediation": {
+      "immediate": [
+        "Revert rate limiter configuration to v1.x semantics",
+        "Notify all TPP partners of restoration"
+      ],
+      "short_term": [
+        "Add TPP rate limit smoke test to deployment pipeline (JIRA OB-120)",
+        "Document rate limiter unit change in internal API runbook RUN-008 (JIRA OPS-2240)",
+        "Schedule PSD2 access compliance review with Open Banking team (JIRA OB-121)"
+      ],
+      "long_term": [
+        "Introduce canary deployments for all API gateway configuration changes",
+        "Implement TPP health dashboard to surface lockout conditions within 60 seconds",
+        "Annual PSD2 readiness audit"
+      ]
+    },
+    "related_incidents": ["INC-2024-004"],
+    "related_documents": ["ARCH-007", "RUN-008", "POL-006"]
+  }
+}

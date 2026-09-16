@@ -1,0 +1,56 @@
+{
+  "document_id": "INC-2024-004",
+  "title": "Faster Payments Submission Failure — Expired TLS Certificate on FPS Connector",
+  "department": "Payments Engineering",
+  "document_type": "incident_report",
+  "access_level": "INTERNAL",
+  "created_date": "2024-03-07",
+  "allowed_roles": ["ENGINEER", "ANALYST", "ADMINISTRATOR"],
+  "severity": "P1",
+  "status": "Resolved",
+  "duration_minutes": 93,
+  "affected_systems": ["fps-connector", "payment-gateway", "retail-banking-api", "notification-service"],
+  "content": {
+    "summary": "The TLS client certificate used by the Faster Payments Scheme (FPS) connector expired at 00:00 UTC on 2024-03-07 because the certificate renewal workflow failed silently 30 days prior. All outbound Faster Payments submissions were rejected by the FPS central infrastructure for 93 minutes, affecting 29,800 retail payment transactions.",
+    "timeline": [
+      {"time": "00:00 UTC", "event": "FPS connector TLS certificate expires; all outbound submissions begin returning TLS handshake errors"},
+      {"time": "00:04 UTC", "event": "payment-gateway payment-failure-rate alert fires (threshold: 5 % failure rate)"},
+      {"time": "00:09 UTC", "event": "On-call engineer identifies TLS handshake failures in fps-connector logs"},
+      {"time": "00:22 UTC", "event": "Certificate renewal team paged; emergency certificate requested from PKI team"},
+      {"time": "01:03 UTC", "event": "New certificate issued and deployed; fps-connector restarted"},
+      {"time": "01:33 UTC", "event": "FPS submission success rate returns to 99.9 %; incident resolved"}
+    ],
+    "root_cause": "The automated certificate renewal cron job (cert-renewal v1.7) failed 30 days prior (2024-02-06) when the PKI API returned HTTP 503 during a maintenance window. The job logged the failure but did not retry and did not page the on-call team. Certificate expiry monitoring only checked for certificates expiring within 7 days and did not fire because at the 7-day point the certificate appeared valid (the renewal failure was not surfaced).",
+    "contributing_factors": [
+      "cert-renewal job had no retry logic on PKI API 503 (same root cause as INC-2024-001 cert-rotator failure pattern)",
+      "Certificate expiry alerting did not distinguish between 'will expire' and 'renewal already attempted and failed'",
+      "FPS connector had no fallback or graceful degradation for TLS failures — returned hard errors to all callers immediately",
+      "No daily audit of certificate renewal job execution success"
+    ],
+    "impact": {
+      "failed_transactions": 29800,
+      "estimated_revenue_loss_gbp": 447000,
+      "customer_complaints": 892,
+      "regulatory_notification_required": false,
+      "scheme_notification_required": true
+    },
+    "remediation": {
+      "immediate": [
+        "Emergency certificate request via PKI fast-track process",
+        "Deploy new certificate and restart fps-connector"
+      ],
+      "short_term": [
+        "Add retry logic with exponential backoff to cert-renewal job (JIRA PAY-9100)",
+        "Add cert-renewal-failure alert independent of expiry date (JIRA OPS-2230)",
+        "Audit all payment connector certificate expiry dates (JIRA OPS-2231)"
+      ],
+      "long_term": [
+        "Implement ACME protocol for automatic certificate lifecycle across all connectors",
+        "Add certificate health check to payment gateway readiness probe",
+        "Unified certificate inventory dashboard"
+      ]
+    },
+    "related_incidents": ["INC-2024-001", "INC-2024-008", "INC-2024-014"],
+    "related_documents": ["ARCH-003", "RUN-002", "POL-005", "RUN-007"]
+  }
+}

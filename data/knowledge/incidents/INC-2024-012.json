@@ -1,0 +1,54 @@
+{
+  "document_id": "INC-2024-012",
+  "title": "Database Connection Pool Exhaustion — Retail Banking API 503 Errors",
+  "department": "Core Banking",
+  "document_type": "incident_report",
+  "access_level": "INTERNAL",
+  "created_date": "2024-07-25",
+  "allowed_roles": ["ENGINEER", "ANALYST", "ADMINISTRATOR"],
+  "severity": "P2",
+  "status": "Resolved",
+  "duration_minutes": 55,
+  "affected_systems": ["retail-banking-api", "core-banking-ledger", "read-replica-cluster", "mobile-banking-api"],
+  "content": {
+    "summary": "A slow query introduced in a new account-summary feature caused connection pool exhaustion on the retail-banking-api on 2024-07-25, resulting in HTTP 503 errors for 22,000 customers over 55 minutes.",
+    "timeline": [
+      {"time": "11:30 UTC", "event": "retail-banking-api v5.2.0 deployed with new account-summary aggregation feature"},
+      {"time": "11:45 UTC", "event": "p99 database query latency climbs from 80 ms to 4.2 s on /api/accounts/summary endpoint"},
+      {"time": "11:52 UTC", "event": "Connection pool reaches 100 % utilisation; 503 errors begin"},
+      {"time": "11:58 UTC", "event": "P2 declared; DBA team identifies missing index on account_transactions.account_id"},
+      {"time": "12:15 UTC", "event": "Hotfix index created concurrently on live database"},
+      {"time": "12:25 UTC", "event": "Query latency returns to 95 ms; connection pool drains; 503 errors cease"}
+    ],
+    "root_cause": "The new account-summary aggregation query performed a full table scan on account_transactions (280 M rows) because the WHERE clause used a function on account_id that prevented index usage. The query was tested against a staging dataset of 50,000 rows which executed in < 100 ms, masking the production performance issue.",
+    "contributing_factors": [
+      "Staging database not sized proportionally to production (0.02 % of production row count)",
+      "No query plan analysis required as part of feature review",
+      "Same connection pool exhaustion pattern as INC-2024-001 — recurring root cause"
+    ],
+    "impact": {
+      "customers_affected": 22000,
+      "duration_minutes": 55,
+      "http_503_count": 180000,
+      "regulatory_notification_required": false
+    },
+    "remediation": {
+      "immediate": [
+        "Create missing index on account_transactions.account_id",
+        "Feature flag: disable account-summary aggregation endpoint"
+      ],
+      "short_term": [
+        "Size staging database to minimum 10 % of production row counts (JIRA DB-450)",
+        "Add EXPLAIN ANALYZE gate to database-touching PRs (JIRA DB-451)",
+        "Fix query to avoid function on indexed column (JIRA RETAIL-890)"
+      ],
+      "long_term": [
+        "Introduce pre-production load testing for all new database queries against production-scale data",
+        "Add automated slow-query detection in CI using pg_stat_statements",
+        "Connection pool autoscaling with load-shedding circuit breaker"
+      ]
+    },
+    "related_incidents": ["INC-2024-001", "INC-2024-003"],
+    "related_documents": ["ARCH-001", "RUN-003", "POL-002"]
+  }
+}

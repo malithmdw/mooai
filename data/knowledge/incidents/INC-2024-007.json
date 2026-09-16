@@ -1,0 +1,58 @@
+{
+  "document_id": "INC-2024-007",
+  "title": "CHAPS High-Value Payment Stuck in Pending — Idempotency Key Collision",
+  "department": "Payments Engineering",
+  "document_type": "incident_report",
+  "access_level": "RESTRICTED",
+  "created_date": "2024-04-18",
+  "allowed_roles": ["ANALYST", "ADMINISTRATOR"],
+  "severity": "P1",
+  "status": "Resolved",
+  "duration_minutes": 188,
+  "affected_systems": ["chaps-gateway", "wire-transfer-service", "transaction-ledger", "core-banking-ledger"],
+  "content": {
+    "summary": "A CHAPS high-value payment of GBP 12.5 M became stuck in PENDING state for 188 minutes on 2024-04-18 due to an idempotency key collision between two separate corporate clients whose reference numbers were hashed identically by a broken hash function introduced in a library upgrade.",
+    "timeline": [
+      {"time": "08:44 UTC", "event": "Corporate client A submits CHAPS payment GBP 12.5 M; idempotency key generated"},
+      {"time": "08:44 UTC", "event": "Corporate client B submits CHAPS payment GBP 3.1 M 200 ms later; same idempotency key generated (collision)"},
+      {"time": "08:45 UTC", "event": "wire-transfer-service deduplicates client B's payment against client A's key; client B receives 200 OK but payment is not submitted"},
+      {"time": "09:02 UTC", "event": "client A payment stuck in PENDING — transaction-ledger shows conflicting ownership on idempotency record"},
+      {"time": "11:52 UTC", "event": "DBA team manually resolves idempotency record conflict; both payments re-submitted with corrected keys"},
+      {"time": "12:12 UTC", "event": "Both CHAPS payments confirmed settled; incident resolved"}
+    ],
+    "root_cause": "The idempotency key generation library was upgraded from hashlib-utils v2.1 to v3.0.0 as part of a routine dependency update. The v3.0.0 release contained a bug (upstream CVE-2024-18821) where the hash function truncated output to 32 bits instead of 256 bits for inputs shorter than 64 bytes, dramatically increasing collision probability. The library update was not subject to payment-path regression testing.",
+    "contributing_factors": [
+      "Dependency upgrades not subject to payment-path integration test suite",
+      "No collision monitoring on the idempotency store (Redis)",
+      "Idempotency key namespace did not include client identifier, making cross-client collisions possible",
+      "Same root cause pattern as INC-2024-002 — shared idempotency store design weakness"
+    ],
+    "impact": {
+      "payments_affected": 2,
+      "highest_value_payment_gbp": 12500000,
+      "duration_pending_minutes": 188,
+      "financial_loss": "None — both payments settled",
+      "regulatory_notification_required": true,
+      "regulatory_body": "Bank of England (CHAPS scheme rules)"
+    },
+    "remediation": {
+      "immediate": [
+        "Pin hashlib-utils to v2.1 across all payment services",
+        "Manually resolve idempotency key conflict in Redis",
+        "Re-submit affected payments with corrected keys"
+      ],
+      "short_term": [
+        "Add client identifier as namespace prefix to all idempotency keys (JIRA PAY-9200)",
+        "Add Redis idempotency collision rate monitor (JIRA PAY-9201)",
+        "Add payment-path regression tests to dependency update pipeline (JIRA PAY-9202)"
+      ],
+      "long_term": [
+        "Evaluate UUIDv7 as idempotency key standard across all payment services",
+        "Introduce automated CVE scanning for payment-critical library dependencies",
+        "Quarterly payment path chaos engineering exercises"
+      ]
+    },
+    "related_incidents": ["INC-2024-002", "INC-2024-011"],
+    "related_documents": ["ARCH-004", "RUN-006", "POL-003"]
+  }
+}

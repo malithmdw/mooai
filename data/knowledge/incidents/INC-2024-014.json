@@ -1,0 +1,57 @@
+{
+  "document_id": "INC-2024-014",
+  "title": "Bacs Direct Debit Submission File Corruption — Incorrect Character Encoding",
+  "department": "Payments Engineering",
+  "document_type": "incident_report",
+  "access_level": "INTERNAL",
+  "created_date": "2024-09-03",
+  "allowed_roles": ["ENGINEER", "ANALYST", "ADMINISTRATOR"],
+  "severity": "P1",
+  "status": "Resolved",
+  "duration_minutes": 244,
+  "affected_systems": ["bacs-submission-service", "direct-debit-processor", "payment-gateway", "core-banking-ledger"],
+  "content": {
+    "summary": "The Bacs Direct Debit submission file for 2024-09-03 was rejected by the Bacs central system due to character encoding corruption introduced by a library upgrade. 68,000 direct debit mandates were not processed, requiring next-day resubmission.",
+    "timeline": [
+      {"time": "18:00 UTC", "event": "Bacs submission window opens; bacs-submission-service begins generating submission file"},
+      {"time": "18:41 UTC", "event": "Submission file (68,000 records) transmitted to Bacs central infrastructure"},
+      {"time": "19:15 UTC", "event": "Bacs returns NACK: 'Invalid character in name field — non-ASCII bytes detected'"},
+      {"time": "19:22 UTC", "event": "P1 declared; engineering team begins investigating encoding issue"},
+      {"time": "22:04 UTC", "event": "Root cause identified: file-writer library upgraded from v4.1 to v5.0 uses UTF-8 output; Bacs requires ASCII"},
+      {"time": "22:44 UTC", "event": "Hotfix deployed with explicit ASCII encoding and character transliteration"},
+      {"time": "23:02 UTC", "event": "Corrected file transmitted; Bacs confirms receipt for next-day processing"}
+    ],
+    "root_cause": "The bacs-submission-service was upgraded to use file-writer v5.0, which changed the default output encoding from ASCII to UTF-8. The Bacs AUDDIS file format specification requires pure ASCII encoding. Customer name fields containing accented characters (e.g., é, ñ, ü) were written as multi-byte UTF-8 sequences, causing the file to fail Bacs validation. The v5.0 upgrade did not flag the encoding change in its breaking changes section.",
+    "contributing_factors": [
+      "Bacs file format specification not included in automated test assertions",
+      "Library upgrade notes not reviewed by payments team (fourth certificate/encoding pattern incident in 2024)",
+      "No pre-submission file validation against Bacs AUDDIS schema"
+    ],
+    "impact": {
+      "mandates_delayed": 68000,
+      "submission_date_delayed": "2024-09-03 to 2024-09-04",
+      "customer_impact": "68,000 customers' direct debits collected one day late",
+      "financial_impact": "Potential late payment charges for some customers",
+      "regulatory_notification_required": true,
+      "regulatory_body": "PSR"
+    },
+    "remediation": {
+      "immediate": [
+        "Hotfix file-writer encoding to ASCII with transliteration fallback",
+        "Retransmit corrected file within Bacs cut-off window"
+      ],
+      "short_term": [
+        "Add Bacs AUDDIS schema validation as pre-submission gate (JIRA PAY-9400)",
+        "Add encoding assertion tests for all payment scheme file generators (JIRA PAY-9401)",
+        "Audit all payment file generators for encoding compliance (JIRA PAY-9402)"
+      ],
+      "long_term": [
+        "Implement payment scheme file format test suite covering all active schemes (Bacs, CHAPS, FPS)",
+        "Automate library upgrade impact analysis for payment-critical services",
+        "Add Bacs file validation tool to development environment"
+      ]
+    },
+    "related_incidents": ["INC-2024-001", "INC-2024-004", "INC-2024-007"],
+    "related_documents": ["ARCH-003", "RUN-005", "POL-003"]
+  }
+}

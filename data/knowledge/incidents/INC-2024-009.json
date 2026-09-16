@@ -1,0 +1,56 @@
+{
+  "document_id": "INC-2024-009",
+  "title": "Fraud Detection Model Drift — False Positive Surge Blocking Legitimate Payments",
+  "department": "Financial Crime",
+  "document_type": "incident_report",
+  "access_level": "INTERNAL",
+  "created_date": "2024-05-14",
+  "allowed_roles": ["ENGINEER", "ANALYST", "ADMINISTRATOR"],
+  "severity": "P2",
+  "status": "Resolved",
+  "duration_minutes": 420,
+  "affected_systems": ["fraud-detection-service", "payment-gateway", "card-processing", "customer-support-portal"],
+  "content": {
+    "summary": "The ML-based fraud detection model began generating excessive false positives from 2024-05-14 08:00 UTC, flagging 18% of legitimate card-not-present transactions as fraudulent. The false positive rate (normally 0.3%) surged due to a data distribution shift caused by a bank holiday weekend payment pattern that the model had not seen in training.",
+    "timeline": [
+      {"time": "08:00 UTC", "event": "Model false-positive rate begins climbing above 0.5 % threshold"},
+      {"time": "09:30 UTC", "event": "Customer support call volume spikes 400 %; payment decline complaints surge"},
+      {"time": "10:15 UTC", "event": "P2 declared; fraud-detection-service flagged as potential root cause"},
+      {"time": "11:00 UTC", "event": "Model score threshold temporarily raised from 0.7 to 0.92 to reduce false positives"},
+      {"time": "13:30 UTC", "event": "False positive rate returns to 1.2 %; threshold adjustment maintained"},
+      {"time": "15:20 UTC", "event": "Root cause confirmed: bank holiday weekend data shift; incident resolved pending model retrain"}
+    ],
+    "root_cause": "The fraud detection model (XGBoost, trained Q4 2023) had not seen a bank holiday weekend payment pattern in training data. The unusual combination of high transaction volumes on Saturday followed by very low Sunday volumes, combined with atypical merchant categories, caused the model to assign high fraud scores to legitimate transactions.",
+    "contributing_factors": [
+      "Model training data did not include bank holiday calendar features",
+      "No model drift monitoring alerting below 5-minute intervals",
+      "Threshold tuning for bank holidays not included in operational runbook"
+    ],
+    "impact": {
+      "false_positive_rate_peak": "18 %",
+      "false_positive_normal": "0.3 %",
+      "legitimate_payments_declined": 43000,
+      "customer_complaints": 2100,
+      "estimated_revenue_loss_gbp": 215000,
+      "regulatory_notification_required": false
+    },
+    "remediation": {
+      "immediate": [
+        "Raise fraud score threshold from 0.7 to 0.92",
+        "Increase customer support staffing"
+      ],
+      "short_term": [
+        "Retrain model with bank holiday calendar feature (JIRA FC-210)",
+        "Implement 1-minute model drift monitoring alert (JIRA FC-211)",
+        "Add bank holiday threshold override to fraud-detection runbook RUN-009 (JIRA FC-212)"
+      ],
+      "long_term": [
+        "Implement continuous model retraining pipeline",
+        "Add online learning capability for rapid distribution shift adaptation",
+        "Quarterly model performance review against seasonal patterns"
+      ]
+    },
+    "related_incidents": [],
+    "related_documents": ["ARCH-008", "RUN-009", "POL-009"]
+  }
+}

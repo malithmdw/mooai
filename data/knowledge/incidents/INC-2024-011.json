@@ -1,0 +1,56 @@
+{
+  "document_id": "INC-2024-011",
+  "title": "Payment Idempotency Store Redis Cluster Failover — Duplicate Debit Charges",
+  "department": "Payments Engineering",
+  "document_type": "incident_report",
+  "access_level": "RESTRICTED",
+  "created_date": "2024-07-09",
+  "allowed_roles": ["ANALYST", "ADMINISTRATOR"],
+  "severity": "P1",
+  "status": "Resolved",
+  "duration_minutes": 37,
+  "affected_systems": ["payment-gateway", "redis-idempotency-cluster", "card-processing", "transaction-ledger"],
+  "content": {
+    "summary": "During a Redis cluster master failover on 2024-07-09, a 37-second window of lost idempotency state caused 214 card payment retries to be processed as new transactions, resulting in duplicate debit charges to customers.",
+    "timeline": [
+      {"time": "22:01 UTC", "event": "Redis primary node network partition detected; automatic failover to replica begins"},
+      {"time": "22:01 UTC", "event": "During 37-second failover window, payment-gateway retries reach new primary with no idempotency state"},
+      {"time": "22:01 UTC", "event": "214 retry transactions processed as new payments; duplicate debits initiated"},
+      {"time": "22:03 UTC", "event": "Automated duplicate-charge detection alerts (same card, same amount, < 60 seconds apart)"},
+      {"time": "22:07 UTC", "event": "P1 declared; card-processing hold activated"},
+      {"time": "22:38 UTC", "event": "All 214 duplicate charges reversed; incident resolved"}
+    ],
+    "root_cause": "Redis replication uses asynchronous writes, meaning in-flight idempotency keys written to the primary node but not yet replicated were lost during the failover. The payment-gateway did not implement a 'wait for replication' strategy (WAIT command) for idempotency key writes, accepting the performance trade-off but not accounting for the duplicate-payment risk.",
+    "contributing_factors": [
+      "Idempotency key replication not synchronous (async replication design decision not reviewed for payment risk)",
+      "Same architectural weakness as INC-2024-002 and INC-2024-007 — idempotency store reliability gap",
+      "Retry logic in payment-gateway did not check for the idempotency store being in failover state before retrying",
+      "Duplicate-charge detection threshold was 60 seconds — failover window was 37 seconds, meaning some duplicates were caught late"
+    ],
+    "impact": {
+      "duplicate_charges": 214,
+      "all_reversed": true,
+      "customer_complaints": 47,
+      "regulatory_notification_required": false
+    },
+    "remediation": {
+      "immediate": [
+        "Activate card-processing hold",
+        "Reverse all 214 duplicate charges",
+        "Implement WAIT 1 500 on idempotency key writes (synchronous replication to 1 replica)"
+      ],
+      "short_term": [
+        "Switch idempotency store to Redis Cluster with synchronous replication (JIRA PAY-9300)",
+        "Add failover-state awareness to payment-gateway retry logic (JIRA PAY-9301)",
+        "Lower duplicate-charge detection window from 60 s to 10 s (JIRA PAY-9302)"
+      ],
+      "long_term": [
+        "Evaluate PostgreSQL-backed idempotency store for durability guarantees (cross-reference ARCH-004)",
+        "Design payment-gateway to be idempotency-store-failure-safe by using two-phase commit",
+        "Quarterly Redis failover drill with idempotency validation"
+      ]
+    },
+    "related_incidents": ["INC-2024-002", "INC-2024-007"],
+    "related_documents": ["ARCH-004", "RUN-006", "POL-003"]
+  }
+}
