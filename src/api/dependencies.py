@@ -15,6 +15,12 @@ from typing import Annotated
 from fastapi import Depends
 
 from src.core.config import Settings, get_settings
+from src.security.auth import AuthenticatedUser, get_current_user
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 """Injects the cached, validated application `Settings`."""
+
+CurrentUserDep = Annotated[AuthenticatedUser, Depends(get_current_user)]
+"""Injects the authenticated caller, or raises `401` — see
+`src.security.auth` for the (POC-only, hardcoded) authentication it performs.
+"""

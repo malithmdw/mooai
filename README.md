@@ -111,10 +111,11 @@ make check            # all of the above (CI gate)
 ## Authentication note (POC)
 
 Authentication is **intentionally hardcoded** for this proof of concept
-(`src/security/auth.py`). Keycloak/OAuth integration is a deliberate,
-tracked future milestone — do not implement it ahead of schedule, and do
-not treat the hardcoded stub as representative of production security
-posture.
+(`src/security/auth.py`, three example users — see
+[`docs/authentication.md`](./docs/authentication.md) for credentials and
+usage). Keycloak/OAuth integration is a deliberate, tracked future
+milestone — do not implement it ahead of schedule, and do not treat the
+hardcoded stub as representative of production security posture.
 
 ## Roadmap (not yet implemented)
 
