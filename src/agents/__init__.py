@@ -13,13 +13,24 @@ State
 
 Budget
 - ``ExecutionBudget``   — resource limits and usage counters for one execution.
+
+Supervisor
+- ``IntentType``           — StrEnum of possible request intents.
+- ``SupervisorDecision``   — Pydantic model for structured LLM output.
+- ``SupervisorAgent``      — Agent class (prefer ``make_supervisor_node``).
+- ``make_supervisor_node`` — Factory returning a LangGraph node callable.
 """
 
 from src.agents.budget import ExecutionBudget
 from src.agents.state import GraphState, initial_state
+from src.agents.supervisor import IntentType, SupervisorAgent, SupervisorDecision, make_supervisor_node
 
 __all__ = [
     "GraphState",
     "initial_state",
     "ExecutionBudget",
+    "IntentType",
+    "SupervisorDecision",
+    "SupervisorAgent",
+    "make_supervisor_node",
 ]
