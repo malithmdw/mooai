@@ -79,11 +79,24 @@ class Settings(BaseSettings):
     model_name: str = "claude-opus-5"
     embedding_model: str = "text-embedding-3-large"
 
+    # --- CORS ---
+    # Least-privilege default: only the documented local Streamlit UI, not
+    # a wildcard. Override per environment via a comma-separated list.
+    cors_allowed_origins: tuple[str, ...] = ("http://localhost:8501",)
+
     @field_validator("log_level", mode="before")
     @classmethod
     def _normalize_log_level(cls, value: object) -> object:
         """Accept any case (`info`, `Info`, `INFO`) for LOG_LEVEL."""
         return value.upper() if isinstance(value, str) else value
+
+    @field_validator("cors_allowed_origins", mode="before")
+    @classmethod
+    def _split_comma_separated_origins(cls, value: object) -> object:
+        """Accept `CORS_ALLOWED_ORIGINS` as a comma-separated env var string."""
+        if isinstance(value, str):
+            return tuple(origin.strip() for origin in value.split(",") if origin.strip())
+        return value
 
     @model_validator(mode="after")
     def _require_provider_credentials_outside_local(self) -> Settings:

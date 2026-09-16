@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -62,3 +63,20 @@ def client() -> Iterator[TestClient]:
     app = create_app()
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture
+async def async_client() -> AsyncIterator[httpx.AsyncClient]:
+    """An `httpx.AsyncClient` bound to a freshly created app instance per test.
+
+    For integration tests exercising the app's async endpoints end-to-end
+    over ASGI, rather than through `TestClient`'s sync wrapper. See
+    `client` for why `create_app` is imported inside the fixture body
+    rather than at module scope.
+    """
+    from src.api.main import create_app
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
+        yield ac
