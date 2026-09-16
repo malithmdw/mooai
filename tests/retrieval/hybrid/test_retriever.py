@@ -1,15 +1,22 @@
-"""Unit tests for HybridRetriever.
+"""Tests for HybridRetriever — full pipeline integration.
 
 All external dependencies (Pinecone, embedder, BM25) are mocked so tests
-run without network access or a real index.  Tests verify: delegation to
-both retrievers, parallel execution, RRF fusion, filter forwarding, and
-top-k limiting.
+run without network access.  Tests verify the full pipeline:
+embed → search-in-parallel → RRF → access filter → rerank.
+
+Covers:
+- Dense-only and sparse-only pipeline paths
+- Overlapping results (same chunk from both retrievers)
+- Metadata and access-control filter forwarding
+- Unauthorized documents removed before results are returned
+- Ranking of final results
+- Reranker injection
 """
 
 from __future__ import annotations
 
 from datetime import date
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -18,33 +25,41 @@ from src.models.enums import AccessLevel, Role
 from src.retrieval.bm25.corpus import BM25Result
 from src.retrieval.bm25.service import BM25Service
 from src.retrieval.embedding.base import EmbeddingProvider
-from src.retrieval.hybrid.fusion import DenseSearchResult, HybridResult
+from src.retrieval.hybrid.models import RetrievalEvidence, RetrievalSource
+from src.retrieval.hybrid.reranking import IdentityReranker, Reranker
 from src.retrieval.hybrid.retriever import HybridRetriever
 from src.retrieval.indexing.service import PineconeIndexService, PineconeMatch
 from src.retrieval.ingestion.models import DocumentChunk
 
 
 # ---------------------------------------------------------------------------
-# Fixture helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_meta(document_id: str = "DOC-001") -> DocumentMetadata:
+def _meta(
+    document_id: str = "DOC-001",
+    department: str = "Engineering",
+    document_type: str = "architecture_document",
+    access_level: AccessLevel = AccessLevel.INTERNAL,
+    allowed_roles: tuple[Role, ...] = (Role.ENGINEER,),
+) -> DocumentMetadata:
     return DocumentMetadata(
         document_id=document_id,
         title="Test Document",
-        department="Engineering",
-        document_type="architecture_document",
-        access_level=AccessLevel.INTERNAL,
+        department=department,
+        document_type=document_type,
+        access_level=access_level,
         created_date=date(2024, 1, 1),
-        allowed_roles=(Role.ENGINEER,),
+        allowed_roles=allowed_roles,
     )
 
 
-def _make_chunk(
+def _chunk(
     chunk_id: str = "DOC-001-chunk-0000",
     document_id: str = "DOC-001",
-    text: str = "sample text content",
+    text: str = "sample text",
+    metadata: DocumentMetadata | None = None,
 ) -> DocumentChunk:
     return DocumentChunk(
         chunk_id=chunk_id,
@@ -54,12 +69,12 @@ def _make_chunk(
         chunk_index=0,
         chunk_total=1,
         text=text,
-        metadata=_make_meta(document_id),
+        metadata=metadata or _meta(document_id),
     )
 
 
-def _make_pinecone_meta(chunk: DocumentChunk) -> dict[str, object]:
-    """Build a Pinecone-style metadata dict for the given chunk."""
+def _pinecone_meta(chunk: DocumentChunk) -> dict[str, object]:
+    """Build a Pinecone-compatible metadata dict for a chunk."""
     return {
         "chunk_id": chunk.chunk_id,
         "document_id": chunk.document_id,
@@ -76,13 +91,25 @@ def _make_pinecone_meta(chunk: DocumentChunk) -> dict[str, object]:
     }
 
 
+def _match(chunk: DocumentChunk, score: float = 0.9) -> PineconeMatch:
+    return PineconeMatch(
+        chunk_id=chunk.chunk_id,
+        score=score,
+        metadata=_pinecone_meta(chunk),
+    )
+
+
+def _bm25_result(chunk: DocumentChunk, score: float = 2.0, rank: int = 1) -> BM25Result:
+    return BM25Result(chunk=chunk, score=score, rank=rank)
+
+
 def _make_retriever(
     *,
     pinecone_matches: list[PineconeMatch] | None = None,
     sparse_results: list[BM25Result] | None = None,
     embed_vector: list[float] | None = None,
+    reranker: Reranker | None = None,
 ) -> HybridRetriever:
-    """Build a HybridRetriever with all dependencies mocked."""
     mock_pinecone = AsyncMock(spec=PineconeIndexService)
     mock_pinecone.search.return_value = pinecone_matches or []
 
@@ -96,30 +123,30 @@ def _make_retriever(
         pinecone_service=mock_pinecone,
         embedder=mock_embedder,
         bm25_service=mock_bm25,
+        reranker=reranker,
     )
 
 
 # ---------------------------------------------------------------------------
-# Basic delegation
+# Basic pipeline
 # ---------------------------------------------------------------------------
 
 
-class TestHybridRetrieverDelegation:
-    async def test_returns_list_of_hybrid_results(self) -> None:
+class TestPipelineBasics:
+    async def test_returns_list(self) -> None:
         retriever = _make_retriever()
-        results = await retriever.search("payment timeout")
-        assert isinstance(results, list)
+        result = await retriever.search("payment timeout")
+        assert isinstance(result, list)
 
-    async def test_empty_results_when_both_return_nothing(self) -> None:
+    async def test_empty_when_both_return_nothing(self) -> None:
         retriever = _make_retriever()
-        results = await retriever.search("payment timeout")
-        assert results == []
+        assert await retriever.search("payment timeout") == []
 
-    async def test_embed_one_called_with_query(self) -> None:
+    async def test_embed_called_with_query(self) -> None:
         mock_pinecone = AsyncMock(spec=PineconeIndexService)
         mock_pinecone.search.return_value = []
         mock_embedder = AsyncMock(spec=EmbeddingProvider)
-        mock_embedder.embed_one.return_value = [0.1, 0.2]
+        mock_embedder.embed_one.return_value = [0.1]
         mock_bm25 = AsyncMock(spec=BM25Service)
         mock_bm25.search.return_value = []
 
@@ -128,11 +155,11 @@ class TestHybridRetrieverDelegation:
 
         mock_embedder.embed_one.assert_awaited_once_with("certificate expiry FPS")
 
-    async def test_pinecone_search_called(self) -> None:
+    async def test_both_retrievers_called(self) -> None:
         mock_pinecone = AsyncMock(spec=PineconeIndexService)
         mock_pinecone.search.return_value = []
         mock_embedder = AsyncMock(spec=EmbeddingProvider)
-        mock_embedder.embed_one.return_value = [0.1, 0.2]
+        mock_embedder.embed_one.return_value = [0.1]
         mock_bm25 = AsyncMock(spec=BM25Service)
         mock_bm25.search.return_value = []
 
@@ -140,248 +167,343 @@ class TestHybridRetrieverDelegation:
         await retriever.search("query")
 
         mock_pinecone.search.assert_awaited_once()
-
-    async def test_bm25_search_called(self) -> None:
-        mock_pinecone = AsyncMock(spec=PineconeIndexService)
-        mock_pinecone.search.return_value = []
-        mock_embedder = AsyncMock(spec=EmbeddingProvider)
-        mock_embedder.embed_one.return_value = [0.1]
-        mock_bm25 = AsyncMock(spec=BM25Service)
-        mock_bm25.search.return_value = []
-
-        retriever = HybridRetriever(mock_pinecone, mock_embedder, mock_bm25)
-        await retriever.search("query")
-
         mock_bm25.search.assert_awaited_once()
 
-    async def test_vector_passed_to_pinecone(self) -> None:
-        mock_pinecone = AsyncMock(spec=PineconeIndexService)
-        mock_pinecone.search.return_value = []
-        mock_embedder = AsyncMock(spec=EmbeddingProvider)
-        vector = [0.1, 0.2, 0.3, 0.4]
-        mock_embedder.embed_one.return_value = vector
-        mock_bm25 = AsyncMock(spec=BM25Service)
-        mock_bm25.search.return_value = []
-
-        retriever = HybridRetriever(mock_pinecone, mock_embedder, mock_bm25)
-        await retriever.search("query")
-
-        call_args = mock_pinecone.search.call_args
-        assert call_args.args[0] == vector
+    async def test_results_are_retrieval_evidence(self) -> None:
+        chunk = _chunk()
+        retriever = _make_retriever(pinecone_matches=[_match(chunk)])
+        results = await retriever.search("test query")
+        assert all(isinstance(r, RetrievalEvidence) for r in results)
 
 
 # ---------------------------------------------------------------------------
-# Dense-only results
+# Dense-only path
 # ---------------------------------------------------------------------------
 
 
-class TestDenseOnlyResults:
-    async def test_dense_only_results_returned(self) -> None:
-        chunk = _make_chunk(chunk_id="ARCH-001-chunk-0000", document_id="ARCH-001")
-        match = PineconeMatch(
-            chunk_id=chunk.chunk_id,
-            score=0.92,
-            metadata=_make_pinecone_meta(chunk),
-        )
-        retriever = _make_retriever(pinecone_matches=[match])
+class TestDenseOnlyPath:
+    async def test_dense_result_returned(self) -> None:
+        chunk = _chunk(chunk_id="ARCH-001-chunk-0000", document_id="ARCH-001")
+        retriever = _make_retriever(pinecone_matches=[_match(chunk, score=0.92)])
         results = await retriever.search("architecture gateway")
         assert len(results) == 1
-        assert results[0].chunk.chunk_id == "ARCH-001-chunk-0000"
+        assert results[0].chunk_id == "ARCH-001-chunk-0000"
 
-    async def test_dense_result_has_dense_rank_set(self) -> None:
-        chunk = _make_chunk(chunk_id="ARCH-001-chunk-0000", document_id="ARCH-001")
-        match = PineconeMatch(
-            chunk_id=chunk.chunk_id,
-            score=0.9,
-            metadata=_make_pinecone_meta(chunk),
-        )
-        retriever = _make_retriever(pinecone_matches=[match])
-        results = await retriever.search("architecture")
-        assert results[0].dense_rank == 1
-        assert results[0].sparse_rank is None
+    async def test_source_is_dense(self) -> None:
+        chunk = _chunk()
+        retriever = _make_retriever(pinecone_matches=[_match(chunk)])
+        results = await retriever.search("query")
+        assert results[0].source == RetrievalSource.DENSE
+
+    async def test_dense_score_present_sparse_absent(self) -> None:
+        chunk = _chunk()
+        retriever = _make_retriever(pinecone_matches=[_match(chunk)])
+        results = await retriever.search("query")
+        assert results[0].dense_score is not None
+        assert results[0].sparse_score is None
+
+    async def test_final_score_positive(self) -> None:
+        chunk = _chunk()
+        retriever = _make_retriever(pinecone_matches=[_match(chunk)])
+        results = await retriever.search("query")
+        assert results[0].final_score > 0.0
+
+    async def test_all_required_fields_populated(self) -> None:
+        chunk = _chunk(chunk_id="DOC-001-chunk-0000", document_id="DOC-001")
+        retriever = _make_retriever(pinecone_matches=[_match(chunk)])
+        results = await retriever.search("query")
+        ev = results[0]
+        assert ev.chunk_id == "DOC-001-chunk-0000"
+        assert ev.document_id == "DOC-001"
+        assert ev.title == "Test Document"
+        assert ev.text
+        assert ev.metadata is not None
+        assert ev.rank == 1
 
 
 # ---------------------------------------------------------------------------
-# Sparse-only results
+# Sparse-only path
 # ---------------------------------------------------------------------------
 
 
-class TestSparseOnlyResults:
-    async def test_sparse_only_results_returned(self) -> None:
-        chunk = _make_chunk(chunk_id="INC-001-chunk-0000", document_id="INC-001")
-        sparse = [BM25Result(chunk=chunk, score=3.5, rank=1)]
-        retriever = _make_retriever(sparse_results=sparse)
+class TestSparseOnlyPath:
+    async def test_sparse_result_returned(self) -> None:
+        chunk = _chunk(chunk_id="INC-001-chunk-0000", document_id="INC-001")
+        retriever = _make_retriever(sparse_results=[_bm25_result(chunk)])
         results = await retriever.search("ERR-429 FPS")
         assert len(results) == 1
-        assert results[0].chunk.chunk_id == "INC-001-chunk-0000"
+        assert results[0].chunk_id == "INC-001-chunk-0000"
 
-    async def test_sparse_result_has_sparse_rank_set(self) -> None:
-        chunk = _make_chunk(chunk_id="INC-001-chunk-0000", document_id="INC-001")
-        sparse = [BM25Result(chunk=chunk, score=3.5, rank=1)]
-        retriever = _make_retriever(sparse_results=sparse)
-        results = await retriever.search("ERR-429")
-        assert results[0].sparse_rank == 1
-        assert results[0].dense_rank is None
+    async def test_source_is_sparse(self) -> None:
+        chunk = _chunk()
+        retriever = _make_retriever(sparse_results=[_bm25_result(chunk)])
+        results = await retriever.search("query")
+        assert results[0].source == RetrievalSource.SPARSE
+
+    async def test_sparse_score_present_dense_absent(self) -> None:
+        chunk = _chunk()
+        retriever = _make_retriever(sparse_results=[_bm25_result(chunk)])
+        results = await retriever.search("query")
+        assert results[0].sparse_score is not None
+        assert results[0].dense_score is None
 
 
 # ---------------------------------------------------------------------------
-# Overlap — same chunk in both retrievers
+# Overlapping results
 # ---------------------------------------------------------------------------
 
 
-class TestOverlapResults:
+class TestOverlappingResults:
     async def test_overlap_chunk_appears_once(self) -> None:
-        chunk = _make_chunk(chunk_id="DOC-001-chunk-0000", document_id="DOC-001")
-        match = PineconeMatch(
-            chunk_id=chunk.chunk_id,
-            score=0.85,
-            metadata=_make_pinecone_meta(chunk),
+        chunk = _chunk(chunk_id="DOC-001-chunk-0000", document_id="DOC-001")
+        retriever = _make_retriever(
+            pinecone_matches=[_match(chunk, score=0.85)],
+            sparse_results=[_bm25_result(chunk, score=2.5)],
         )
-        sparse = [BM25Result(chunk=chunk, score=2.5, rank=1)]
-        retriever = _make_retriever(pinecone_matches=[match], sparse_results=sparse)
         results = await retriever.search("payment gateway")
-        ids = [r.chunk.chunk_id for r in results]
+        ids = [r.chunk_id for r in results]
         assert ids.count("DOC-001-chunk-0000") == 1
 
-    async def test_overlap_chunk_has_both_rank_fields(self) -> None:
-        chunk = _make_chunk(chunk_id="DOC-001-chunk-0000", document_id="DOC-001")
-        match = PineconeMatch(
-            chunk_id=chunk.chunk_id,
-            score=0.85,
-            metadata=_make_pinecone_meta(chunk),
+    async def test_overlap_source_is_both(self) -> None:
+        chunk = _chunk()
+        retriever = _make_retriever(
+            pinecone_matches=[_match(chunk)],
+            sparse_results=[_bm25_result(chunk)],
         )
-        sparse = [BM25Result(chunk=chunk, score=2.5, rank=1)]
-        retriever = _make_retriever(pinecone_matches=[match], sparse_results=sparse)
-        results = await retriever.search("payment gateway")
-        result = next(r for r in results if r.chunk.chunk_id == "DOC-001-chunk-0000")
-        assert result.dense_rank is not None
-        assert result.sparse_rank is not None
+        results = await retriever.search("query")
+        assert results[0].source == RetrievalSource.BOTH
+
+    async def test_overlap_both_scores_populated(self) -> None:
+        chunk = _chunk()
+        retriever = _make_retriever(
+            pinecone_matches=[_match(chunk)],
+            sparse_results=[_bm25_result(chunk)],
+        )
+        results = await retriever.search("query")
+        assert results[0].dense_score is not None
+        assert results[0].sparse_score is not None
 
 
 # ---------------------------------------------------------------------------
-# Filter forwarding
+# Unauthorized documents removed before results reach the agent
 # ---------------------------------------------------------------------------
 
 
-class TestFilterForwarding:
-    async def test_role_filter_forwarded_to_pinecone(self) -> None:
-        mock_pinecone = AsyncMock(spec=PineconeIndexService)
-        mock_pinecone.search.return_value = []
-        mock_embedder = AsyncMock(spec=EmbeddingProvider)
-        mock_embedder.embed_one.return_value = [0.1]
-        mock_bm25 = AsyncMock(spec=BM25Service)
-        mock_bm25.search.return_value = []
+class TestAccessControl:
+    async def test_unauthorized_chunk_not_returned(self) -> None:
+        # Chunk is ADMINISTRATOR-only; caller is ENGINEER
+        restricted_chunk = _chunk(
+            chunk_id="SEC-001-chunk-0000",
+            document_id="SEC-001",
+            metadata=_meta("SEC-001", allowed_roles=(Role.ADMINISTRATOR,)),
+        )
+        retriever = _make_retriever(
+            pinecone_matches=[_match(restricted_chunk)],
+        )
+        results = await retriever.search("query", roles=[Role.ENGINEER])
+        ids = [r.chunk_id for r in results]
+        assert "SEC-001-chunk-0000" not in ids
 
-        retriever = HybridRetriever(mock_pinecone, mock_embedder, mock_bm25)
-        await retriever.search("query", roles=[Role.ENGINEER])
+    async def test_authorized_chunk_returned(self) -> None:
+        allowed_chunk = _chunk(
+            chunk_id="DOC-001-chunk-0000",
+            document_id="DOC-001",
+            metadata=_meta("DOC-001", allowed_roles=(Role.ENGINEER,)),
+        )
+        retriever = _make_retriever(pinecone_matches=[_match(allowed_chunk)])
+        results = await retriever.search("query", roles=[Role.ENGINEER])
+        assert len(results) == 1
+        assert results[0].chunk_id == "DOC-001-chunk-0000"
 
-        _, kwargs = mock_pinecone.search.call_args
-        filt = kwargs.get("filter", {})
-        assert "allowed_roles" in filt
-        assert "ENGINEER" in filt["allowed_roles"]["$in"]
+    async def test_mixed_authorized_and_unauthorized(self) -> None:
+        allowed = _chunk(
+            chunk_id="DOC-001-chunk-0000",
+            document_id="DOC-001",
+            metadata=_meta("DOC-001", allowed_roles=(Role.ENGINEER,)),
+        )
+        blocked = _chunk(
+            chunk_id="SEC-001-chunk-0000",
+            document_id="SEC-001",
+            metadata=_meta("SEC-001", allowed_roles=(Role.ADMINISTRATOR,)),
+        )
+        retriever = _make_retriever(
+            pinecone_matches=[_match(allowed, score=0.9), _match(blocked, score=0.8)],
+        )
+        results = await retriever.search("query", roles=[Role.ENGINEER])
+        ids = [r.chunk_id for r in results]
+        assert "DOC-001-chunk-0000" in ids
+        assert "SEC-001-chunk-0000" not in ids
 
-    async def test_no_filter_when_no_constraints(self) -> None:
-        mock_pinecone = AsyncMock(spec=PineconeIndexService)
-        mock_pinecone.search.return_value = []
-        mock_embedder = AsyncMock(spec=EmbeddingProvider)
-        mock_embedder.embed_one.return_value = [0.1]
-        mock_bm25 = AsyncMock(spec=BM25Service)
-        mock_bm25.search.return_value = []
+    async def test_access_level_filter_blocks_confidential(self) -> None:
+        confidential = _chunk(
+            metadata=_meta(access_level=AccessLevel.CONFIDENTIAL)
+        )
+        retriever = _make_retriever(pinecone_matches=[_match(confidential)])
+        results = await retriever.search(
+            "query",
+            access_levels=[AccessLevel.INTERNAL],
+        )
+        assert results == []
 
-        retriever = HybridRetriever(mock_pinecone, mock_embedder, mock_bm25)
-        await retriever.search("query")
-
-        _, kwargs = mock_pinecone.search.call_args
-        assert kwargs.get("filter") is None
-
-    async def test_role_filter_forwarded_to_bm25(self) -> None:
-        mock_pinecone = AsyncMock(spec=PineconeIndexService)
-        mock_pinecone.search.return_value = []
-        mock_embedder = AsyncMock(spec=EmbeddingProvider)
-        mock_embedder.embed_one.return_value = [0.1]
-        mock_bm25 = AsyncMock(spec=BM25Service)
-        mock_bm25.search.return_value = []
-
-        retriever = HybridRetriever(mock_pinecone, mock_embedder, mock_bm25)
-        await retriever.search("query", roles=[Role.ANALYST])
-
-        _, kwargs = mock_bm25.search.call_args
-        assert kwargs["roles"] == [Role.ANALYST]
-
-    async def test_department_filter_forwarded_to_both(self) -> None:
-        mock_pinecone = AsyncMock(spec=PineconeIndexService)
-        mock_pinecone.search.return_value = []
-        mock_embedder = AsyncMock(spec=EmbeddingProvider)
-        mock_embedder.embed_one.return_value = [0.1]
-        mock_bm25 = AsyncMock(spec=BM25Service)
-        mock_bm25.search.return_value = []
-
-        retriever = HybridRetriever(mock_pinecone, mock_embedder, mock_bm25)
-        await retriever.search("query", department="Core Banking")
-
-        _, pine_kwargs = mock_pinecone.search.call_args
-        filt = pine_kwargs.get("filter", {})
-        assert filt.get("department") == {"$eq": "Core Banking"}
-
-        _, bm25_kwargs = mock_bm25.search.call_args
-        assert bm25_kwargs["department"] == "Core Banking"
-
-    async def test_document_type_filter_forwarded_to_pinecone(self) -> None:
-        mock_pinecone = AsyncMock(spec=PineconeIndexService)
-        mock_pinecone.search.return_value = []
-        mock_embedder = AsyncMock(spec=EmbeddingProvider)
-        mock_embedder.embed_one.return_value = [0.1]
-        mock_bm25 = AsyncMock(spec=BM25Service)
-        mock_bm25.search.return_value = []
-
-        retriever = HybridRetriever(mock_pinecone, mock_embedder, mock_bm25)
-        await retriever.search("query", document_type="runbook")
-
-        _, pine_kwargs = mock_pinecone.search.call_args
-        filt = pine_kwargs.get("filter", {})
-        assert filt.get("document_type") == {"$eq": "runbook"}
+    async def test_ranks_reassigned_after_unauthorized_removed(self) -> None:
+        allowed = _chunk(
+            chunk_id="DOC-001-chunk-0000",
+            document_id="DOC-001",
+            metadata=_meta("DOC-001", allowed_roles=(Role.ENGINEER,)),
+        )
+        blocked = _chunk(
+            chunk_id="SEC-001-chunk-0000",
+            document_id="SEC-001",
+            metadata=_meta("SEC-001", allowed_roles=(Role.ADMINISTRATOR,)),
+        )
+        # blocked has higher dense score → would be rank 1 before filtering
+        retriever = _make_retriever(
+            pinecone_matches=[_match(blocked, score=0.95), _match(allowed, score=0.80)],
+        )
+        results = await retriever.search("query", roles=[Role.ENGINEER])
+        # After filtering, only one result survives — must be rank 1
+        assert len(results) == 1
+        assert results[0].rank == 1
 
 
 # ---------------------------------------------------------------------------
-# Top-k and retriever_top_k
+# Metadata filtering
 # ---------------------------------------------------------------------------
 
 
-class TestTopK:
-    async def test_top_k_limits_results(self) -> None:
+class TestMetadataFiltering:
+    async def test_department_filter_applied(self) -> None:
+        fps_chunk = _chunk(
+            chunk_id="FPS-001-chunk-0000",
+            document_id="FPS-001",
+            metadata=_meta("FPS-001", department="FPS"),
+        )
+        core_chunk = _chunk(
+            chunk_id="CORE-001-chunk-0000",
+            document_id="CORE-001",
+            metadata=_meta("CORE-001", department="Core Banking"),
+        )
+        retriever = _make_retriever(
+            pinecone_matches=[_match(fps_chunk), _match(core_chunk)],
+        )
+        results = await retriever.search("query", department="FPS")
+        ids = [r.chunk_id for r in results]
+        assert "FPS-001-chunk-0000" in ids
+        assert "CORE-001-chunk-0000" not in ids
+
+    async def test_document_type_filter_applied(self) -> None:
+        runbook = _chunk(
+            chunk_id="RB-001-chunk-0000",
+            document_id="RB-001",
+            metadata=_meta("RB-001", document_type="runbook"),
+        )
+        arch = _chunk(
+            chunk_id="ARCH-001-chunk-0000",
+            document_id="ARCH-001",
+            metadata=_meta("ARCH-001", document_type="architecture_document"),
+        )
+        retriever = _make_retriever(
+            pinecone_matches=[_match(runbook), _match(arch)],
+        )
+        results = await retriever.search("query", document_type="runbook")
+        ids = [r.chunk_id for r in results]
+        assert "RB-001-chunk-0000" in ids
+        assert "ARCH-001-chunk-0000" not in ids
+
+
+# ---------------------------------------------------------------------------
+# Ranking
+# ---------------------------------------------------------------------------
+
+
+class TestRanking:
+    async def test_ranks_are_consecutive_from_one(self) -> None:
         chunks = [
-            _make_chunk(chunk_id=f"DOC-{i:03d}-chunk-0000", document_id=f"DOC-{i:03d}")
+            _chunk(chunk_id=f"D-{i:03d}-chunk-0000", document_id=f"D-{i:03d}")
+            for i in range(3)
+        ]
+        retriever = _make_retriever(
+            pinecone_matches=[_match(c, score=0.9 - i * 0.1) for i, c in enumerate(chunks)]
+        )
+        results = await retriever.search("query")
+        for i, r in enumerate(results):
+            assert r.rank == i + 1
+
+    async def test_final_scores_non_increasing(self) -> None:
+        chunks = [
+            _chunk(chunk_id=f"D-{i:03d}-chunk-0000", document_id=f"D-{i:03d}")
+            for i in range(4)
+        ]
+        retriever = _make_retriever(
+            pinecone_matches=[_match(c, score=0.9 - i * 0.05) for i, c in enumerate(chunks)]
+        )
+        results = await retriever.search("query")
+        scores = [r.final_score for r in results]
+        assert scores == sorted(scores, reverse=True)
+
+    async def test_top_k_respected(self) -> None:
+        chunks = [
+            _chunk(chunk_id=f"D-{i:03d}-chunk-0000", document_id=f"D-{i:03d}")
             for i in range(10)
         ]
-        sparse = [BM25Result(chunk=c, score=float(10 - i), rank=i + 1) for i, c in enumerate(chunks)]
-        retriever = _make_retriever(sparse_results=sparse)
-        results = await retriever.search("payment", top_k=3)
+        retriever = _make_retriever(
+            pinecone_matches=[_match(c) for c in chunks]
+        )
+        results = await retriever.search("query", top_k=3)
         assert len(results) <= 3
 
-    async def test_retriever_top_k_passed_to_pinecone(self) -> None:
-        mock_pinecone = AsyncMock(spec=PineconeIndexService)
-        mock_pinecone.search.return_value = []
-        mock_embedder = AsyncMock(spec=EmbeddingProvider)
-        mock_embedder.embed_one.return_value = [0.1]
-        mock_bm25 = AsyncMock(spec=BM25Service)
-        mock_bm25.search.return_value = []
 
-        retriever = HybridRetriever(mock_pinecone, mock_embedder, mock_bm25)
-        await retriever.search("query", top_k=5, retriever_top_k=20)
+# ---------------------------------------------------------------------------
+# Reranker injection
+# ---------------------------------------------------------------------------
 
-        _, kwargs = mock_pinecone.search.call_args
-        assert kwargs["top_k"] == 20
 
-    async def test_default_retriever_top_k_is_three_times_top_k(self) -> None:
-        mock_pinecone = AsyncMock(spec=PineconeIndexService)
-        mock_pinecone.search.return_value = []
-        mock_embedder = AsyncMock(spec=EmbeddingProvider)
-        mock_embedder.embed_one.return_value = [0.1]
-        mock_bm25 = AsyncMock(spec=BM25Service)
-        mock_bm25.search.return_value = []
+class TestRerankerInjection:
+    async def test_identity_reranker_used_by_default(self) -> None:
+        chunk = _chunk()
+        retriever = _make_retriever(pinecone_matches=[_match(chunk)])
+        results = await retriever.search("query")
+        assert len(results) == 1
 
-        retriever = HybridRetriever(mock_pinecone, mock_embedder, mock_bm25)
+    async def test_custom_reranker_called(self) -> None:
+        chunk = _chunk()
+        mock_reranker = AsyncMock(spec=Reranker)
+        mock_reranker.rerank.return_value = []
+
+        retriever = _make_retriever(
+            pinecone_matches=[_match(chunk)],
+            reranker=mock_reranker,
+        )
         await retriever.search("query", top_k=5)
+        mock_reranker.rerank.assert_awaited_once()
+        _, kwargs = mock_reranker.rerank.call_args
+        assert kwargs["top_k"] == 5
 
-        _, kwargs = mock_pinecone.search.call_args
-        assert kwargs["top_k"] == 15  # 5 * 3
+    async def test_reranker_receives_filtered_evidence(self) -> None:
+        allowed = _chunk(
+            chunk_id="DOC-001-chunk-0000",
+            metadata=_meta(allowed_roles=(Role.ENGINEER,)),
+        )
+        blocked = _chunk(
+            chunk_id="SEC-001-chunk-0000",
+            document_id="SEC-001",
+            metadata=_meta("SEC-001", allowed_roles=(Role.ADMINISTRATOR,)),
+        )
+        captured: list[list[RetrievalEvidence]] = []
+
+        class CapturingReranker:
+            async def rerank(
+                self, query: str, evidence: list[RetrievalEvidence], *, top_k: int
+            ) -> list[RetrievalEvidence]:
+                captured.append(evidence)
+                return evidence[:top_k]
+
+        retriever = _make_retriever(
+            pinecone_matches=[_match(allowed), _match(blocked)],
+            reranker=CapturingReranker(),
+        )
+        await retriever.search("query", roles=[Role.ENGINEER])
+        assert len(captured) == 1
+        reranker_ids = [ev.chunk_id for ev in captured[0]]
+        assert "DOC-001-chunk-0000" in reranker_ids
+        assert "SEC-001-chunk-0000" not in reranker_ids

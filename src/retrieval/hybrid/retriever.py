@@ -1,28 +1,26 @@
-"""Hybrid retriever: dense (Pinecone) + sparse (BM25) with RRF fusion.
+"""HybridRetriever — full pipeline: embed → search → normalise → RRF → filter → rerank.
 
-Queries both retrievers in parallel via ``asyncio.gather``, converts
-Pinecone matches back to ``DocumentChunk`` objects using
-``metadata_to_chunk``, then merges the two ranked lists with
-Reciprocal Rank Fusion.
+Pipeline
+--------
+1. Embed the query (OpenAI, one call).
+2. Search Pinecone (dense) and BM25 (sparse) in parallel — both retrievers
+   receive RBAC filters as an early-exit optimisation.
+3. Build ``DenseHit`` and ``SparseHit`` lists from the results.
+4. ``reciprocal_rank_fusion`` — normalise scores, accumulate RRF scores,
+   sort, emit ``RetrievalEvidence`` with full provenance.
+5. ``apply_access_filter`` — authoritative RBAC gate; re-ranks survivors.
+6. ``reranker.rerank`` — optional cross-encoder pass (no-op by default).
 
-Each retriever receives its own access filter so RBAC is enforced at both
-layers — not just in one.  The Pinecone filter uses MongoDB-style predicates
-(``$in``, ``$eq``); the BM25 filter uses the same domain types passed through
-to ``BM25Corpus.search``.
+Access filtering is applied at TWO points intentionally:
+- During retrieval (Pinecone filter, BM25 corpus filter): reduces the
+  candidate pool for efficiency.
+- Post-RRF (``apply_access_filter``): the authoritative enforcement check
+  that cannot be bypassed by a misconfigured upstream layer.
 
-Usage
------
-    from src.retrieval.hybrid import HybridRetriever
-    from src.retrieval.indexing import make_pinecone_service
-    from src.retrieval.embedding import make_openai_provider
-    from src.retrieval.bm25 import BM25Service
-
-    retriever = HybridRetriever(
-        pinecone_service=make_pinecone_service(settings),
-        embedder=make_openai_provider(settings),
-        bm25_service=BM25Service.from_chunks(chunks),
-    )
-    results = await retriever.search("certificate expiry FPS", roles=[Role.ENGINEER])
+The ``retriever_top_k`` parameter controls how many candidates each retriever
+fetches.  Fetching more candidates than ``top_k`` gives RRF more material to
+work with, especially when overlap between the two lists is low.  The default
+is ``top_k * 3``.
 """
 
 from __future__ import annotations
@@ -32,15 +30,14 @@ import logging
 import time
 from collections.abc import Sequence
 
-from src.core.logging import get_logger, log_debug, log_info
+from src.core.logging import get_logger, log_info, log_debug
 from src.models.enums import AccessLevel, Role
 from src.retrieval.bm25.service import BM25Service
 from src.retrieval.embedding.base import EmbeddingProvider
-from src.retrieval.hybrid.fusion import (
-    DenseSearchResult,
-    HybridResult,
-    reciprocal_rank_fusion,
-)
+from src.retrieval.hybrid.filtering import apply_access_filter
+from src.retrieval.hybrid.fusion import DenseHit, SparseHit, reciprocal_rank_fusion
+from src.retrieval.hybrid.models import RetrievalEvidence
+from src.retrieval.hybrid.reranking import IdentityReranker, Reranker
 from src.retrieval.indexing.metadata import metadata_to_chunk
 from src.retrieval.indexing.service import PineconeIndexService
 
@@ -50,18 +47,19 @@ _DEFAULT_RETRIEVER_MULTIPLIER: int = 3
 
 
 class HybridRetriever:
-    """Combines Pinecone dense search and BM25 sparse search via RRF.
+    """Orchestrates the hybrid retrieval pipeline.
 
-    Parameters
-    ----------
-    pinecone_service:
-        ``PineconeIndexService`` configured for the target index/namespace.
-    embedder:
-        Embedding provider used to turn the query string into a vector for
-        the Pinecone dense search.
-    bm25_service:
-        ``BM25Service`` built from the same corpus that was indexed into
-        Pinecone.
+    Accepts injected dependencies so every component is independently
+    replaceable and testable:
+
+    - ``pinecone_service`` — dense vector search (Pinecone).
+    - ``embedder`` — converts the query string to a dense vector.
+    - ``bm25_service`` — sparse keyword search (BM25).
+    - ``reranker`` — optional cross-encoder (defaults to no-op).
+
+    The retriever is stateless after construction: calling ``search``
+    multiple times with the same arguments always produces the same output
+    for the same underlying index state.
     """
 
     def __init__(
@@ -69,10 +67,13 @@ class HybridRetriever:
         pinecone_service: PineconeIndexService,
         embedder: EmbeddingProvider,
         bm25_service: BM25Service,
+        *,
+        reranker: Reranker | None = None,
     ) -> None:
         self._pinecone = pinecone_service
         self._embedder = embedder
         self._bm25 = bm25_service
+        self._reranker: Reranker = reranker if reranker is not None else IdentityReranker()
 
     async def search(
         self,
@@ -84,36 +85,33 @@ class HybridRetriever:
         department: str | None = None,
         document_type: str | None = None,
         retriever_top_k: int | None = None,
-    ) -> list[HybridResult]:
-        """Search the hybrid index and return the top-*k* fused results.
-
-        Both retrievers are queried in parallel (after the embedding step).
-        Results are merged with Reciprocal Rank Fusion and the top *top_k*
-        are returned.
+    ) -> list[RetrievalEvidence]:
+        """Run the full hybrid retrieval pipeline and return ranked evidence.
 
         Parameters
         ----------
         query:
-            Natural-language or keyword query string.
+            User query string; embedded for dense search and tokenized for
+            sparse search.
         top_k:
-            Number of results to return from the fused ranking.
+            Maximum number of ``RetrievalEvidence`` items to return after
+            filtering and reranking.
         roles:
-            If provided, only chunks accessible to these roles are returned.
-            Applied to both Pinecone (via metadata filter) and BM25 (via
-            corpus filter).
+            RBAC roles of the requesting user.  Forwarded to both retrievers
+            and to the post-RRF access filter.
         access_levels:
-            If provided, restrict to these access levels.  Applied to both
-            retrievers.
+            Restrict results to these access levels.  Applied at both
+            retrieval and post-RRF filter stages.
         department:
-            If provided, restrict to this department (exact match).
+            Restrict to this department (exact match).
         document_type:
-            If provided, restrict to this document type (exact match).
+            Restrict to this document type (exact match).
         retriever_top_k:
-            How many candidates each retriever fetches before fusion.
-            Defaults to ``top_k * 3`` to give RRF enough material to work
-            with, especially when overlap between the two lists is low.
+            Candidates fetched from each retriever before fusion.  Defaults
+            to ``top_k * 3``; increase when recall is low.
         """
         rk = retriever_top_k if retriever_top_k is not None else top_k * _DEFAULT_RETRIEVER_MULTIPLIER
+        t0 = time.monotonic()
 
         log_debug(
             logger,
@@ -124,9 +122,11 @@ class HybridRetriever:
             retriever_top_k=rk,
         )
 
-        t0 = time.monotonic()
+        # --- Step 1: embed the query ---
+        vector = await self._embedder.embed_one(query)
 
-        # Build Pinecone metadata filter — all active predicates combined.
+        # --- Step 2: search both retrievers in parallel ---
+        # Build Pinecone metadata filter from all active predicates.
         pinecone_filter: dict[str, object] = {}
         if roles is not None:
             pinecone_filter["allowed_roles"] = {"$in": [r.value for r in roles]}
@@ -139,10 +139,7 @@ class HybridRetriever:
 
         filter_arg: dict[str, object] | None = pinecone_filter or None
 
-        # Embed the query, then search both retrievers in parallel.
-        vector = await self._embedder.embed_one(query)
-
-        dense_matches, sparse_results = await asyncio.gather(
+        dense_matches, sparse_bm25 = await asyncio.gather(
             self._pinecone.search(vector, top_k=rk, filter=filter_arg),
             self._bm25.search(
                 query,
@@ -154,9 +151,9 @@ class HybridRetriever:
             ),
         )
 
-        # Convert raw Pinecone matches to typed DenseSearchResult objects.
-        dense_results: list[DenseSearchResult] = [
-            DenseSearchResult(
+        # --- Step 3: build typed hit lists ---
+        dense_hits: list[DenseHit] = [
+            DenseHit(
                 chunk=metadata_to_chunk(match.metadata),
                 score=match.score,
                 rank=i + 1,
@@ -164,7 +161,29 @@ class HybridRetriever:
             for i, match in enumerate(dense_matches)
         ]
 
-        results = reciprocal_rank_fusion(dense_results, sparse_results, top_k=top_k)
+        sparse_hits: list[SparseHit] = [
+            SparseHit(
+                chunk=sr.chunk,
+                score=sr.score,
+                rank=sr.rank,
+            )
+            for sr in sparse_bm25
+        ]
+
+        # --- Step 4: RRF fusion (normalise + merge + rank) ---
+        fused = reciprocal_rank_fusion(dense_hits, sparse_hits, top_k=rk)
+
+        # --- Step 5: authoritative post-RRF access filter ---
+        filtered = apply_access_filter(
+            fused,
+            roles=roles,
+            access_levels=access_levels,
+            department=department,
+            document_type=document_type,
+        )
+
+        # --- Step 6: optional reranking ---
+        results = await self._reranker.rerank(query, filtered, top_k=top_k)
 
         elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
         log_info(
@@ -172,8 +191,10 @@ class HybridRetriever:
             "hybrid.search.completed",
             "Hybrid search completed",
             query=query,
-            dense_count=len(dense_results),
-            sparse_count=len(sparse_results),
+            dense_candidates=len(dense_hits),
+            sparse_candidates=len(sparse_hits),
+            fused_count=len(fused),
+            filtered_count=len(filtered),
             result_count=len(results),
             elapsed_ms=elapsed_ms,
         )
