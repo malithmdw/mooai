@@ -19,9 +19,15 @@ Supervisor
 - ``SupervisorDecision``   — Pydantic model for structured LLM output.
 - ``SupervisorAgent``      — Agent class (prefer ``make_supervisor_node``).
 - ``make_supervisor_node`` — Factory returning a LangGraph node callable.
+
+Retrieval
+- ``RetrievalAgent``      — Agent class (prefer ``make_retrieval_node``).
+- ``make_retrieval_node`` — Factory returning a LangGraph node callable.
+- ``generate_queries``    — Query-generation helper.
 """
 
 from src.agents.budget import ExecutionBudget
+from src.agents.retrieval import RetrievalAgent, generate_queries, make_retrieval_node
 from src.agents.state import GraphState, initial_state
 from src.agents.supervisor import IntentType, SupervisorAgent, SupervisorDecision, make_supervisor_node
 
@@ -33,4 +39,7 @@ __all__ = [
     "SupervisorDecision",
     "SupervisorAgent",
     "make_supervisor_node",
+    "RetrievalAgent",
+    "make_retrieval_node",
+    "generate_queries",
 ]
