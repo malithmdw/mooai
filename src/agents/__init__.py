@@ -31,6 +31,10 @@ Response
 - ``ResponseAgent``      — Agent class (prefer ``make_response_node``).
 - ``make_response_node`` — Factory returning a LangGraph node callable.
 
+Research (see ``docs/rlm.md``)
+- ``ResearchAgent``      — Agent class (prefer ``make_research_node``).
+- ``make_research_node`` — Factory returning a LangGraph node callable.
+
 Guardrails
 - ``InputGuard``              — Pattern-based validator for user message text.
 - ``DocumentInjectionGuard``  — Scans retrieved documents for injected instructions.
@@ -57,34 +61,42 @@ from src.agents.guardrails import (
     OutputValidationResult,
     ThreatType,
 )
+from src.agents.research import ResearchAgent, make_research_node
 from src.agents.response import ConfidenceLevel, ResponseAgent, ResponseDecision, make_response_node
 from src.agents.retrieval import RetrievalAgent, generate_queries, make_retrieval_node
 from src.agents.state import GraphState, initial_state
-from src.agents.supervisor import IntentType, SupervisorAgent, SupervisorDecision, make_supervisor_node
+from src.agents.supervisor import (
+    IntentType,
+    SupervisorAgent,
+    SupervisorDecision,
+    make_supervisor_node,
+)
 
 __all__ = [
-    "GraphState",
-    "initial_state",
-    "ExecutionBudget",
-    "IntentType",
-    "SupervisorDecision",
-    "SupervisorAgent",
-    "make_supervisor_node",
-    "RetrievalAgent",
-    "make_retrieval_node",
-    "generate_queries",
-    "ConfidenceLevel",
-    "ResponseDecision",
-    "ResponseAgent",
-    "make_response_node",
-    "InputGuard",
-    "DocumentInjectionGuard",
-    "OutputGuard",
-    "ThreatType",
-    "InputValidationResult",
-    "DocumentScanResult",
-    "OutputValidationResult",
     "INJECTION_BLOCKED_RESPONSE",
-    "CitationGuardrail",
     "SAFE_FAILURE_RESPONSE",
+    "CitationGuardrail",
+    "ConfidenceLevel",
+    "DocumentInjectionGuard",
+    "DocumentScanResult",
+    "ExecutionBudget",
+    "GraphState",
+    "InputGuard",
+    "InputValidationResult",
+    "IntentType",
+    "OutputGuard",
+    "OutputValidationResult",
+    "ResearchAgent",
+    "ResponseAgent",
+    "ResponseDecision",
+    "RetrievalAgent",
+    "SupervisorAgent",
+    "SupervisorDecision",
+    "ThreatType",
+    "generate_queries",
+    "initial_state",
+    "make_research_node",
+    "make_response_node",
+    "make_retrieval_node",
+    "make_supervisor_node",
 ]

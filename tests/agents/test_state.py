@@ -29,7 +29,6 @@ from src.models.user import User
 from src.models.validation import ValidationResult
 from src.retrieval.hybrid.models import RetrievalEvidence, RetrievalSource
 
-
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
@@ -379,16 +378,14 @@ class TestReplaceTransitions:
         state = initial_state()
         task = ResearchTask(
             task_id="task-0001",
-            conversation_id="conv-0001",
-            objective="Find FPS docs",
+            question="Find FPS docs",
         )
         state = _apply_update(state, {"research_tasks": [task]})
         assert len(state["research_tasks"]) == 1
 
         task_updated = ResearchTask(
             task_id="task-0001",
-            conversation_id="conv-0001",
-            objective="Find FPS docs",
+            question="Find FPS docs",
             status=ResearchStatus.COMPLETED,
         )
         state = _apply_update(state, {"research_tasks": [task_updated]})
@@ -571,8 +568,7 @@ class TestSerialization:
     def test_state_with_research_tasks_is_serializable(self) -> None:
         task = ResearchTask(
             task_id="task-0001",
-            conversation_id="conv-0001",
-            objective="Research FPS auth",
+            question="Research FPS auth",
         )
         state = initial_state()
         state = _apply_update(state, {"research_tasks": [task]})
