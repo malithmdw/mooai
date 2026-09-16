@@ -8,9 +8,16 @@ to `retrieval`, `memory`, or `agents` directly — see CLAUDE.md
 
 Public surface
 --------------
-- ``ChatService``    — orchestrates the full agent pipeline for one chat turn.
+- ``ChatService``          — orchestrates the full agent pipeline for one
+  chat turn.
+- ``ToolExecutionService``  — the single enforced gateway every tool
+  invocation (knowledge search, Python analysis, MCP enterprise data) must
+  pass through; see `src.services.tool_execution` for the pipeline.
+- ``ToolExecutionError``    — internal structured-rejection error raised
+  (and always caught) inside `ToolExecutionService.execute`.
 """
 
 from src.services.chat import ChatService
+from src.services.tool_execution import ToolExecutionError, ToolExecutionService
 
-__all__ = ["ChatService"]
+__all__ = ["ChatService", "ToolExecutionError", "ToolExecutionService"]

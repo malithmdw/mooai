@@ -13,6 +13,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from src.models.common import EntityId, NonEmptyStr, utcnow
+from src.models.errors import ErrorCode
 
 
 class ToolCall(BaseModel):
@@ -34,6 +35,7 @@ class ToolResult(BaseModel):
     tool_call_id: EntityId
     success: bool
     output: JsonValue = None
+    error_code: ErrorCode | None = None
     error_message: str | None = None
     completed_at: datetime = Field(default_factory=utcnow)
 
