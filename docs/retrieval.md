@@ -208,3 +208,129 @@ Queries must specify the same namespace to reach the right partition.
   which retries on 429s automatically.  For very large corpora, consider
   running the embedding step with `--dry-run` to generate vectors first,
   then upserting from a cached file.
+
+---
+
+# BM25 Sparse Retrieval
+
+BM25 (Okapi BM25) is a classical keyword-frequency ranking function that
+complements Pinecone's dense vector search.  The two retrievers have
+different strengths; combining them (hybrid retrieval) produces better
+recall than either alone.
+
+## Architecture
+
+```
+DocumentChunk list
+      │
+      ▼  src/retrieval/bm25/tokenizer.py
+ [tokenize]     lowercase + alphanumeric split, stop-word removal
+      │
+      ▼  rank_bm25.BM25Okapi (in-process, no network)
+ [BM25Corpus]   in-memory index, RBAC-aware search()
+      │
+      ▼  asyncio.to_thread
+ [BM25Service]  async facade — never blocks the event loop
+```
+
+The corpus is built once from a ``list[DocumentChunk]`` and is immutable.
+Rebuild it whenever documents are re-indexed.
+
+## Usage
+
+```python
+from src.retrieval.bm25 import BM25Service
+from src.models.enums import Role
+
+# Build once (synchronous BM25Okapi construction)
+service = BM25Service.from_chunks(chunks)
+
+# Search asynchronously — runs in a thread pool
+results = await service.search(
+    "FPS certificate expiry ERR-503",
+    top_k=10,
+    roles=[Role.ENGINEER],
+)
+
+for r in results:
+    print(r.rank, r.score, r.chunk.chunk_id, r.chunk.title)
+```
+
+## Tokenizer
+
+`src/retrieval/bm25/tokenizer.py` — `tokenize(text) -> list[str]`
+
+- Splits on any non-alphanumeric character.
+- Lowercases all tokens.
+- Drops tokens shorter than two characters (single letters, lone digits).
+- Removes common English stop words.
+- **Preserves technical identifiers**: `FPS-ERR-429` → `["fps", "err",
+  "429"]`; `HMAC-SHA256` → `["hmac", "sha256"]`.
+
+The same function is used for both corpus indexing and query tokenization
+so the vocabulary is always consistent.
+
+## Metadata and RBAC filtering
+
+`BM25Corpus.search` accepts the same filter parameters as Pinecone's
+`build_access_filter`:
+
+| Parameter       | Type                      | Effect                                   |
+|-----------------|---------------------------|------------------------------------------|
+| `roles`         | `Sequence[Role] \| None`  | Keep chunks whose `allowed_roles` overlap |
+| `access_levels` | `Sequence[AccessLevel] \| None` | Keep chunks at these sensitivity levels |
+| `department`    | `str \| None`             | Exact match on `department`              |
+| `document_type` | `str \| None`             | Exact match on `document_type`           |
+
+Chunks that fail any predicate are excluded before ranking — they never
+appear in results regardless of their BM25 score.
+
+## Source files
+
+| File                                             | Responsibility                                  |
+|--------------------------------------------------|-------------------------------------------------|
+| `src/retrieval/bm25/tokenizer.py`                | `tokenize` — shared tokenizer                   |
+| `src/retrieval/bm25/corpus.py`                   | `BM25Corpus`, `BM25Result`                      |
+| `src/retrieval/bm25/service.py`                  | `BM25Service` — async facade                    |
+| `tests/retrieval/bm25/test_tokenizer.py`         | Tokenizer unit tests                            |
+| `tests/retrieval/bm25/test_corpus.py`            | Corpus unit tests (incl. BM25 advantage cases)  |
+| `tests/retrieval/bm25/test_service.py`           | Service unit tests                              |
+
+## BM25 vs dense retrieval — trade-offs
+
+Hybrid retrieval combines both signals because each retriever has distinct
+failure modes.
+
+| Scenario                        | BM25 (sparse)                          | Dense (Pinecone)                          |
+|---------------------------------|----------------------------------------|-------------------------------------------|
+| Exact error codes (`ERR-429`)   | ✅ Token match; high precision          | ❌ May embed to semantically adjacent doc  |
+| Rare terms (`idempotency`)      | ✅ High IDF → high rank for rare tokens | ⚠ Under-weighted if rare in training data |
+| Numeric identifiers (`20240115`)| ✅ Exact token match                   | ❌ Embedding may not distinguish numbers   |
+| Algorithm names (`HMAC-SHA256`) | ✅ Exact token match on both sub-tokens | ⚠ Depends on pre-training vocabulary      |
+| Full query-term coverage        | ✅ All terms must appear for high score | ⚠ Score is cosine of aggregate embedding  |
+| Semantic paraphrasing           | ❌ Vocabulary mismatch → zero score    | ✅ Synonyms and related concepts matched   |
+| Spelling variation              | ❌ Must match exact tokens              | ✅ Embedding is robust to minor variants   |
+| Cross-lingual queries           | ❌ Language-specific stop words         | ✅ Multilingual embeddings available       |
+| Zero-shot concepts              | ❌ OOV terms never match               | ✅ Contextual embedding generalises        |
+| No network / no API cost        | ✅ Fully local, instant                | ❌ Requires embedding API call             |
+| Deterministic results           | ✅ Same query → same ranking always    | ⚠ Model updates can shift rankings        |
+| Explainability                  | ✅ Score = weighted token frequencies  | ❌ Cosine similarity is opaque             |
+
+### Recommended query routing
+
+- Use **BM25 first** when the query contains: error codes, document IDs,
+  algorithm names, version strings, or any verbatim identifier.
+- Use **dense first** when the query is a natural-language question or
+  contains likely synonyms/paraphrases.
+- For production: run both in parallel and merge results (Reciprocal Rank
+  Fusion or a learned ranker).
+
+### BM25 parameters
+
+| Parameter | Default | Effect                                              |
+|-----------|---------|-----------------------------------------------------|
+| `k1`      | 1.5     | TF saturation — higher = TF keeps contributing longer |
+| `b`       | 0.75    | Length normalisation — 1.0 = full normalisation      |
+
+For short banking documents (chunks ≤ 1 500 chars) the defaults are
+generally appropriate.  Decrease `b` if document lengths vary widely.
