@@ -57,6 +57,11 @@ class ChatResponse(BaseModel):
 
     Every `Citation.evidence_id` must reference an `Evidence` entry present
     in this same response — see CLAUDE.md "invalid citation references".
+
+    ``agent_activity`` is a human-readable execution trace derived from the
+    final graph state.  Each entry describes one observable pipeline step
+    (e.g. "Retrieval Agent → 8 chunks retrieved").  It is informational only
+    and must never expose internal chain-of-thought or security state.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -66,6 +71,7 @@ class ChatResponse(BaseModel):
     message: NonEmptyStr
     evidence: tuple[Evidence, ...] = Field(default_factory=tuple)
     citations: tuple[Citation, ...] = Field(default_factory=tuple)
+    agent_activity: tuple[str, ...] = Field(default_factory=tuple)
     generated_at: datetime = Field(default_factory=utcnow)
 
     @model_validator(mode="after")

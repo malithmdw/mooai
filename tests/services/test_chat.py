@@ -105,9 +105,13 @@ class TestRouteAfterSupervisor:
         state = _state(intent="knowledge_question")
         assert _route_after_supervisor(state) == "retrieval"
 
-    def test_analytical_research_routes_to_retrieval(self) -> None:
+    def test_analytical_research_routes_to_research(self) -> None:
         state = _state(intent="analytical_research")
-        assert _route_after_supervisor(state) == "retrieval"
+        assert _route_after_supervisor(state) == "research"
+
+    def test_tool_request_routes_to_tool_execution(self) -> None:
+        state = _state(intent="tool_request")
+        assert _route_after_supervisor(state) == "tool_execution"
 
     def test_mixed_request_routes_to_retrieval(self) -> None:
         state = _state(intent="mixed_request")
